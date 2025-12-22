@@ -93,19 +93,19 @@ add a volume correction step.
 
 ```mermaid
 flowchart TD
-    A[Start: phi, velocity] --> B[Build flags from phi]
-    B --> C[Apply boundaries + fluid mask]
-    C --> D[CFL clamp dt]
-    D --> E[Add forces]
-    E --> F[Advect velocity]
-    F --> G[Diffuse velocity]
-    G --> H[Project (pressure solve)]
-    H --> I[Extrapolate velocity into air]
-    I --> J[Advect phi]
-    J --> K[Reinitialize phi]
-    K --> L[Volume correction]
-    L --> M[Neumann boundary for phi]
-    M --> N[Output next state]
+    A["Start: phi, velocity"] --> B["Build flags from phi"]
+    B --> C["Apply boundaries + fluid mask"]
+    C --> D["CFL clamp dt"]
+    D --> E["Add forces"]
+    E --> F["Advect velocity"]
+    F --> G["Diffuse velocity"]
+    G --> H["Project (pressure solve)"]
+    H --> I["Extrapolate velocity into air"]
+    I --> J["Advect phi"]
+    J --> K["Reinitialize phi"]
+    K --> L["Volume correction"]
+    L --> M["Neumann boundary for phi"]
+    M --> N["Output next state"]
 ```
 
 ## Mental Model: Why This Works

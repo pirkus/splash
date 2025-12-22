@@ -71,18 +71,18 @@ This is fast to iterate on, but the interface tends to smear and behave more lik
 
 ```mermaid
 flowchart TD
-    A[Start: density, velocity] --> B[Flags from density]
-    B --> C[Apply boundaries + fluid mask]
-    C --> D[CFL clamp dt]
-    D --> E[Add forces]
-    E --> F[Advect velocity]
-    F --> G[Diffuse velocity]
-    G --> H[Project (pressure solve)]
-    H --> I[Advect density]
-    I --> J[Diffuse density]
-    J --> K[Clamp/rescale density]
-    K --> L[Update flags]
-    L --> M[Output next state]
+    A["Start: density, velocity"] --> B["Flags from density"]
+    B --> C["Apply boundaries + fluid mask"]
+    C --> D["CFL clamp dt"]
+    D --> E["Add forces"]
+    E --> F["Advect velocity"]
+    F --> G["Diffuse velocity"]
+    G --> H["Project (pressure solve)"]
+    H --> I["Advect density"]
+    I --> J["Diffuse density"]
+    J --> K["Clamp/rescale density"]
+    K --> L["Update flags"]
+    L --> M["Output next state"]
 ```
 
 ## Mental Model: Why This Works
