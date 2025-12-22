@@ -21,6 +21,7 @@ This is fast to iterate on, but the interface tends to smear and behave more lik
 ### 1) Build flags from density
 - If `density > threshold` => fluid, else air. Solids override.
 - Purpose: only project and mask fluid cells, and treat air as free surface.
+- Example:
 
 ### 2) Apply boundaries + fluid mask
 - Apply domain boundary conditions (no-slip walls) on the staggered velocity.
@@ -37,6 +38,11 @@ This is fast to iterate on, but the interface tends to smear and behave more lik
 - **Buoyancy** (optional) pushes based on density vs ambient.
 - **Surface tension** (optional) is approximated using density gradients.
 - Purpose: drive motion and add surface cohesion.
+- Example (gravity on v_y):
+```
+v_y = 0.0, gravity = -9.0, dt = 0.1
+v_y <- v_y + gravity * dt = -0.9
+```
 
 ### 5) Advect velocity (Semi-Lagrangian or BFECC)
 - Backtrace each face center to sample the old velocity.
@@ -56,6 +62,12 @@ This is fast to iterate on, but the interface tends to smear and behave more lik
 
 ### 9) Diffuse density (optional)
 - Apply a Laplacian with a diffusion coefficient.
+- Example:
+```
+diffusion = 0.01, dt = 0.1, laplacian(rho) = -4.0
+rho <- rho + diffusion * dt * laplacian(rho)
+rho <- rho - 0.004
+```
 
 ### 10) Clamp and rescale density (optional)
 - Clamp to `[0, 1]` to keep it physically bounded.
@@ -65,31 +77,3 @@ This is fast to iterate on, but the interface tends to smear and behave more lik
 - Recompute fluid/air flags from density after advection/diffusion.
 - Purpose: keep the free surface aligned with the scalar field.
 
----
-
-## Step Flow (Mermaid)
-
-```mermaid
-flowchart TD
-    A["Start: density, velocity"] --> B["Flags from density"]
-    B --> C["Apply boundaries + fluid mask"]
-    C --> D["CFL clamp dt"]
-    D --> E["Add forces"]
-    E --> F["Advect velocity"]
-    F --> G["Diffuse velocity"]
-    G --> H["Project (pressure solve)"]
-    H --> I["Advect density"]
-    I --> J["Diffuse density"]
-    J --> K["Clamp/rescale density"]
-    K --> L["Update flags"]
-    L --> M["Output next state"]
-```
-
-## Mental Model: Why This Works
-
-- MAC + projection enforces incompressibility, which is the core of liquid motion.
-- The density scalar serves as a proxy for the interface, but it is not a true
-  surface tracker, so diffusion and advection errors can smear it over time.
-
-If you want, I can add a side-by-side comparison of the two pipelines and the
-exact function names used in code.

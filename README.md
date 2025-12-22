@@ -47,33 +47,6 @@ Surface models (two options):
 
 Default mode: the viewer starts in Level-set mode (press `1` or `2` to switch).
 
-## Per-Step Overview
-
-Density-based step (MAC + density):
-1. Apply domain/solid boundaries and optional fluid mask.
-2. Clamp dt by CFL.
-3. Add body forces (gravity, optional buoyancy/surface tension).
-4. Advect velocity (Semi-Lagrangian or BFECC).
-5. Diffuse velocity (viscosity).
-6. Project (solve pressure, enforce divergence-free).
-7. Advect density.
-8. Diffuse density (optional).
-9. Threshold density to update fluid/air flags.
-
-Level-set step (MAC + phi):
-1. Build fluid/air flags from `phi`.
-2. Apply domain/solid boundaries and fluid mask.
-3. Clamp dt by CFL.
-4. Add body forces and surface tension (from `phi` curvature).
-5. Advect velocity (Semi-Lagrangian or BFECC).
-6. Diffuse velocity (viscosity).
-7. Project (solve pressure, enforce divergence-free).
-8. Extrapolate velocity into air (optional, improves surface motion).
-9. Advect `phi`.
-10. Reinitialize `phi` toward a signed-distance field.
-11. Shift `phi` to preserve volume (optional).
-12. Enforce zero-normal gradient at boundaries.
-
 ## Navier-Stokes in This Project
 
 The incompressible Navier-Stokes equations model fluid motion:
@@ -89,17 +62,6 @@ In this codebase:
 - External forces add `f` (gravity and optional surface tension).
 - A pressure projection enforces `∇ · u = 0` by solving a Poisson equation.
 - Free surfaces are modeled either by a density field or by a level-set `phi`.
-
-## Project Layout
-
-- `src/main.rs` : Vulkan viewer and simulation loop.
-- `src/mac_sim.rs` : MAC solver (density-based).
-- `src/level_set.rs` : Level-set free-surface solver.
-- `src/hud.rs` : tiny HUD glyph renderer.
-- `src/render/` : Vulkan setup and renderer.
-- `PLAN.md` : staged project roadmap.
-- `LEVEL_SET_SIM_STEP.md` : level-set step-by-step.
-- `DENSITY_SIM_STEP.md` : density step-by-step.
 
 ## Tests
 

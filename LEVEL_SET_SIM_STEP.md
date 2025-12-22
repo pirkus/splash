@@ -47,6 +47,11 @@ add a volume correction step.
   - Apply force `f = σ * kappa * δ(phi) * n`.
   - `δ(phi)` is a smoothed delta in a thin band around the surface.
 - Purpose: gravity drives motion; surface tension smooths small surface ripples.
+- Example (surface tension band weight):
+```
+eps = 1.0, phi = 0.0
+delta(phi) = 0.5 / eps * (1 + cos(pi * phi / eps)) = 0.5
+```
 
 ### 5) Advect velocity (Semi-Lagrangian or BFECC)
 - Trace from each face center **backwards** along velocity to sample the old velocity.
@@ -82,40 +87,14 @@ add a volume correction step.
 - Measure current fluid volume as the integral of a smooth Heaviside of `phi`.
 - Find an offset `c` so that `phi + c` matches the **target volume** via bisection.
 - Purpose: prevent steady water-level loss or gain across many steps.
+- Example:
+```
+target volume = 1000, current volume = 990
+Find c so volume(phi + c) = 1000
+Apply: phi <- phi + c
+```
 
 ### 12) Enforce zero-normal gradient at boundaries
 - Copy interior `phi` to boundary cells (Neumann condition).
 - Purpose: prevents artificial slopes at the left/right walls.
 
----
-
-## Step Flow (Mermaid)
-
-```mermaid
-flowchart TD
-    A["Start: phi, velocity"] --> B["Build flags from phi"]
-    B --> C["Apply boundaries + fluid mask"]
-    C --> D["CFL clamp dt"]
-    D --> E["Add forces"]
-    E --> F["Advect velocity"]
-    F --> G["Diffuse velocity"]
-    G --> H["Project (pressure solve)"]
-    H --> I["Extrapolate velocity into air"]
-    I --> J["Advect phi"]
-    J --> K["Reinitialize phi"]
-    K --> L["Volume correction"]
-    L --> M["Neumann boundary for phi"]
-    M --> N["Output next state"]
-```
-
-## Mental Model: Why This Works
-
-- **MAC grid** makes incompressibility robust because pressure correction happens
-  on cell centers while velocity is stored at faces.
-- **Level-set surface** gives a sharp interface; reinit + volume correction
-  keeps that interface well-behaved over time.
-- **Projection** is the key to “liquid-like” motion: it removes non-physical
-  divergence that causes sinking or expansion.
-
-If you want a deeper dive into any sub-step (e.g., PCG details, curvature estimation,
-or CFL constraints), call it out and I can expand that section.
