@@ -1,0 +1,12 @@
+[package]
+name = "nav-stokes-sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+ash = "0.37"
+ash-window = "0.12"
+raw-window-handle = "0.5"
+shaderc = "0.8"
+winit = "0.28"

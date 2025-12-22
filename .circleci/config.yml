@@ -1,0 +1,18 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: cimg/rust:1.78
+    working_directory: ~/project
+    steps:
+      - checkout
+      - run:
+          name: Run tests
+          command: cargo test
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      - test
