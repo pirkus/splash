@@ -1,11 +1,13 @@
 use crate::{
-    apply_domain_boundaries, apply_solid_boundaries,
-    mac_sim::{
-        add_body_force, advect_scalar, advect_scalar_bfecc, advect_velocity,
-        advect_velocity_bfecc, apply_fluid_mask, diffuse_velocity, project_with_flags,
-        AdvectionScheme,
+    apply_domain_boundaries, apply_solid_boundaries, mac::apply_domain_boundaries_into,
+    mac::apply_solid_boundaries_into, mac_sim::{
+        add_body_force, add_body_force_into, advect_scalar, advect_scalar_bfecc,
+        advect_scalar_bfecc_into, advect_scalar_into, advect_velocity, advect_velocity_bfecc,
+        advect_velocity_bfecc_into, advect_velocity_into, apply_fluid_mask, apply_fluid_mask_into,
+        diffuse_velocity, diffuse_velocity_into, project_with_flags, project_with_flags_into,
+        AdvectionScheme, PcgScratch, SurfaceTensionScratch,
     },
-    vec_field::VecField2, BoundaryConfig, CellFlags, CellType, Field2, MacVelocity2,
+    vec_field::VecField2, BoundaryConfig, CellFlags, CellType, Field2, MacGrid2, MacVelocity2,
     StaggeredField2, Vec2,
 };
 
@@ -34,6 +36,48 @@ pub struct LevelSetState {
     pub phi: Field2,
     pub velocity: MacVelocity2,
     pub flags: CellFlags,
+}
+
+#[derive(Clone, Debug)]
+pub struct LevelSetWorkspace {
+    velocity_a: MacVelocity2,
+    velocity_b: MacVelocity2,
+    velocity_scratch: MacVelocity2,
+    phi_a: Field2,
+    phi_b: Field2,
+    phi_scratch: Field2,
+    divergence: Field2,
+    pressure: Field2,
+    pcg: PcgScratch,
+    surface: SurfaceTensionScratch,
+}
+
+impl LevelSetWorkspace {
+    pub fn new(grid: MacGrid2) -> Self {
+        let cell_grid = grid.cell_grid();
+        let velocity_a = MacVelocity2::new(grid, Vec2::zero());
+        let velocity_b = MacVelocity2::new(grid, Vec2::zero());
+        let velocity_scratch = MacVelocity2::new(grid, Vec2::zero());
+        let phi_a = Field2::new(cell_grid, 0.0);
+        let phi_b = Field2::new(cell_grid, 0.0);
+        let phi_scratch = Field2::new(cell_grid, 0.0);
+        let divergence = Field2::new(cell_grid, 0.0);
+        let pressure = Field2::new(cell_grid, 0.0);
+        let pcg = PcgScratch::new(cell_grid);
+        let surface = SurfaceTensionScratch::new(cell_grid);
+        Self {
+            velocity_a,
+            velocity_b,
+            velocity_scratch,
+            phi_a,
+            phi_b,
+            phi_scratch,
+            divergence,
+            pressure,
+            pcg,
+            surface,
+        }
+    }
 }
 
 pub fn level_set_step(state: &LevelSetState, params: LevelSetParams) -> LevelSetState {
@@ -96,6 +140,159 @@ pub fn level_set_step(state: &LevelSetState, params: LevelSetParams) -> LevelSet
     }
 }
 
+pub fn level_set_step_in_place(
+    state: &mut LevelSetState,
+    params: LevelSetParams,
+    scratch: &mut LevelSetWorkspace,
+) {
+    state.flags = flags_from_phi(&state.phi, &state.flags);
+    scratch.velocity_a.clone_from(&state.velocity);
+    apply_domain_boundaries_into(&mut scratch.velocity_b, &scratch.velocity_a, params.boundaries);
+    apply_solid_boundaries_into(&mut scratch.velocity_a, &scratch.velocity_b, &state.flags);
+    apply_fluid_mask_into(&mut scratch.velocity_b, &scratch.velocity_a, &state.flags);
+    let dt = clamp_dt(params.dt, params.cfl, &scratch.velocity_b);
+    add_body_force_into(&mut scratch.velocity_a, &scratch.velocity_b, params.body_force, dt);
+    if params.surface_tension != 0.0 && dt != 0.0 {
+        add_surface_tension_phi_into(
+            &mut scratch.velocity_b,
+            &scratch.velocity_a,
+            &state.phi,
+            params.surface_tension,
+            params.surface_tension_band,
+            dt,
+            &mut scratch.surface,
+        );
+    } else {
+        scratch.velocity_b.clone_from(&scratch.velocity_a);
+    }
+    apply_domain_boundaries_into(&mut scratch.velocity_a, &scratch.velocity_b, params.boundaries);
+    apply_solid_boundaries_into(&mut scratch.velocity_b, &scratch.velocity_a, &state.flags);
+    apply_fluid_mask_into(&mut scratch.velocity_a, &scratch.velocity_b, &state.flags);
+    match params.advection {
+        AdvectionScheme::SemiLagrangian => {
+            advect_velocity_into(
+                &mut scratch.velocity_b,
+                &scratch.velocity_a,
+                &scratch.velocity_a,
+                dt,
+            );
+        }
+        AdvectionScheme::Bfecc => {
+            advect_velocity_bfecc_into(
+                &mut scratch.velocity_b,
+                &mut scratch.velocity_scratch,
+                &scratch.velocity_a,
+                &scratch.velocity_a,
+                dt,
+            );
+        }
+    }
+    apply_fluid_mask_into(&mut scratch.velocity_a, &scratch.velocity_b, &state.flags);
+    diffuse_velocity_into(
+        &mut scratch.velocity_b,
+        &scratch.velocity_a,
+        params.viscosity,
+        dt,
+    );
+    project_with_flags_into(
+        &mut scratch.velocity_a,
+        &scratch.velocity_b,
+        &state.flags,
+        params.pressure_iters,
+        params.pressure_tol,
+        &mut scratch.divergence,
+        &mut scratch.pressure,
+        &mut scratch.pcg,
+    );
+    apply_domain_boundaries_into(&mut scratch.velocity_b, &scratch.velocity_a, params.boundaries);
+    apply_solid_boundaries_into(&mut scratch.velocity_a, &scratch.velocity_b, &state.flags);
+    apply_fluid_mask_into(&mut scratch.velocity_b, &scratch.velocity_a, &state.flags);
+    state.velocity.clone_from(&scratch.velocity_b);
+    let advect_velocity = if params.extrapolation_iters > 0 {
+        extrapolate_velocity(&state.velocity, &state.flags, params.extrapolation_iters)
+    } else {
+        state.velocity.clone()
+    };
+    match params.advection {
+        AdvectionScheme::SemiLagrangian => {
+            advect_scalar_into(&mut scratch.phi_a, &state.phi, &advect_velocity, dt);
+        }
+        AdvectionScheme::Bfecc => {
+            advect_scalar_bfecc_into(
+                &mut scratch.phi_a,
+                &mut scratch.phi_scratch,
+                &state.phi,
+                &advect_velocity,
+                dt,
+            );
+        }
+    }
+    reinitialize_phi_in_place(
+        &mut scratch.phi_a,
+        &mut scratch.phi_scratch,
+        &mut scratch.phi_b,
+        params.reinit_iters,
+        params.reinit_dt,
+    );
+    if params.preserve_volume {
+        scratch.phi_a = correct_phi_volume(
+            &scratch.phi_a,
+            params.target_volume,
+            params.volume_band,
+        );
+    }
+    scratch.phi_b.clone_from(&scratch.phi_a);
+    enforce_phi_neumann_in_place(&mut scratch.phi_a, &scratch.phi_b);
+    state.phi.clone_from(&scratch.phi_a);
+    state.flags = flags_from_phi(&state.phi, &state.flags);
+}
+
+pub fn advect_level_set_surface_in_place(
+    phi: &mut Field2,
+    velocity: &MacVelocity2,
+    flags: &CellFlags,
+    params: LevelSetParams,
+    scratch: &mut LevelSetWorkspace,
+) {
+    let advect_velocity = if params.extrapolation_iters > 0 {
+        extrapolate_velocity(velocity, flags, params.extrapolation_iters)
+    } else {
+        velocity.clone()
+    };
+    let dt = clamp_dt(params.dt, params.cfl, &advect_velocity);
+    match params.advection {
+        AdvectionScheme::SemiLagrangian => {
+            advect_scalar_into(&mut scratch.phi_a, phi, &advect_velocity, dt);
+        }
+        AdvectionScheme::Bfecc => {
+            advect_scalar_bfecc_into(
+                &mut scratch.phi_a,
+                &mut scratch.phi_scratch,
+                phi,
+                &advect_velocity,
+                dt,
+            );
+        }
+    }
+    reinitialize_phi_in_place(
+        &mut scratch.phi_a,
+        &mut scratch.phi_b,
+        &mut scratch.phi_scratch,
+        params.reinit_iters,
+        params.reinit_dt,
+    );
+    if params.preserve_volume {
+        scratch.phi_a = correct_phi_volume(
+            &scratch.phi_a,
+            params.target_volume,
+            params.volume_band,
+        );
+    }
+    scratch.phi_b.clone_from(&scratch.phi_a);
+    enforce_phi_neumann_in_place(&mut scratch.phi_a, &scratch.phi_b);
+    phi.clone_from(&scratch.phi_a);
+}
+
 pub fn flags_from_phi(phi: &Field2, base_flags: &CellFlags) -> CellFlags {
     let grid = phi.grid();
     CellFlags::from_fn(grid, |x, y| match base_flags.get(x, y) {
@@ -136,6 +333,23 @@ pub fn reinitialize_phi(phi: &Field2, iterations: usize, dt: f32) -> Field2 {
     (0..iterations).fold(phi.clone(), |current, _| reinit_step(&current, &phi0, dt))
 }
 
+pub fn reinitialize_phi_in_place(
+    phi: &mut Field2,
+    phi0: &mut Field2,
+    scratch: &mut Field2,
+    iterations: usize,
+    dt: f32,
+) {
+    if iterations == 0 || dt == 0.0 {
+        return;
+    }
+    phi0.clone_from(phi);
+    for _ in 0..iterations {
+        reinit_step_into(scratch, phi, phi0, dt);
+        std::mem::swap(phi, scratch);
+    }
+}
+
 fn clamp_dt(dt: f32, cfl: f32, velocity: &MacVelocity2) -> f32 {
     if dt <= 0.0 || cfl <= 0.0 {
         return dt;
@@ -155,6 +369,20 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     }
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+fn reinit_step_into(out: &mut Field2, phi: &Field2, phi0: &Field2, dt: f32) {
+    let grid = phi.grid();
+    let dx = grid.dx();
+    out.fill_with_index(|x, y| {
+        let phi0_value = phi0.get(x, y);
+        let s = smooth_sign(phi0_value, dx);
+        if s == 0.0 {
+            return phi.get(x, y);
+        }
+        let grad = godunov_gradient(phi, x as i32, y as i32, s);
+        phi.get(x, y) - dt * s * (grad - 1.0)
+    });
 }
 
 fn correct_phi_volume(phi: &Field2, target_volume: f32, band: f32) -> Field2 {
@@ -294,6 +522,76 @@ fn add_surface_tension_phi(
         value + force.sample_linear(pos).y * dt
     });
     MacVelocity2::from_components(velocity.grid(), u, v)
+}
+
+fn add_surface_tension_phi_into(
+    out: &mut MacVelocity2,
+    velocity: &MacVelocity2,
+    phi: &Field2,
+    surface_tension: f32,
+    band: f32,
+    dt: f32,
+    scratch: &mut SurfaceTensionScratch,
+) {
+    if surface_tension == 0.0 || dt == 0.0 {
+        out.clone_from(velocity);
+        return;
+    }
+    let grid = phi.grid();
+    let dx = grid.dx();
+    let eps = if band > 0.0 { band } else { 1.5 * dx };
+    scratch.normals.u_mut().fill_with_index(|x, y| {
+        let xi = x as i32;
+        let yi = y as i32;
+        let grad = phi_gradient(phi, xi, yi);
+        let mag = (grad.x * grad.x + grad.y * grad.y).sqrt();
+        if mag > 1e-6 {
+            grad.x / mag
+        } else {
+            0.0
+        }
+    });
+    scratch.normals.v_mut().fill_with_index(|x, y| {
+        let xi = x as i32;
+        let yi = y as i32;
+        let grad = phi_gradient(phi, xi, yi);
+        let mag = (grad.x * grad.x + grad.y * grad.y).sqrt();
+        if mag > 1e-6 {
+            grad.y / mag
+        } else {
+            0.0
+        }
+    });
+    scratch.curvature.fill_with_index(|x, y| {
+        let xi = x as i32;
+        let yi = y as i32;
+        let nx_r = scratch.normals.u().sample_clamped(xi + 1, yi);
+        let nx_l = scratch.normals.u().sample_clamped(xi - 1, yi);
+        let ny_u = scratch.normals.v().sample_clamped(xi, yi + 1);
+        let ny_d = scratch.normals.v().sample_clamped(xi, yi - 1);
+        -((nx_r - nx_l) + (ny_u - ny_d)) / (2.0 * dx)
+    });
+    scratch.grad_mag.fill_with_index(|x, y| smooth_delta(phi.get(x, y), eps));
+    scratch.force.u_mut().fill_with_index(|x, y| {
+        let n = scratch.normals.u().get(x, y);
+        let kappa = scratch.curvature.get(x, y);
+        let d = scratch.grad_mag.get(x, y);
+        surface_tension * kappa * d * n
+    });
+    scratch.force.v_mut().fill_with_index(|x, y| {
+        let n = scratch.normals.v().get(x, y);
+        let kappa = scratch.curvature.get(x, y);
+        let d = scratch.grad_mag.get(x, y);
+        surface_tension * kappa * d * n
+    });
+    out.u_mut().fill_with_index(|x, y| {
+        let pos = velocity.u().grid().index_position(x, y);
+        velocity.u().get(x, y) + scratch.force.sample_linear(pos).x * dt
+    });
+    out.v_mut().fill_with_index(|x, y| {
+        let pos = velocity.v().grid().index_position(x, y);
+        velocity.v().get(x, y) + scratch.force.sample_linear(pos).y * dt
+    });
 }
 
 fn smooth_delta(phi: f32, eps: f32) -> f32 {
@@ -495,6 +793,35 @@ fn enforce_phi_neumann(phi: &Field2) -> Field2 {
     })
 }
 
+fn enforce_phi_neumann_in_place(phi: &mut Field2, source: &Field2) {
+    let grid = phi.grid();
+    let width = grid.width();
+    let height = grid.height();
+    phi.fill_with_index(|x, y| {
+        let boundary = x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+        if !boundary {
+            return source.get(x, y);
+        }
+        let ix = if x == 0 {
+            1
+        } else if x + 1 == width {
+            width.saturating_sub(2)
+        } else {
+            x
+        };
+        let iy = if y == 0 {
+            1
+        } else if y + 1 == height {
+            height.saturating_sub(2)
+        } else {
+            y
+        };
+        let ix = ix.min(width.saturating_sub(1));
+        let iy = iy.min(height.saturating_sub(1));
+        source.get(ix, iy)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +940,37 @@ mod tests {
     }
 
     #[test]
+    fn advect_level_set_surface_keeps_phi_with_zero_velocity() {
+        let grid = MacGrid2::new(5, 5, 1.0);
+        let mut phi = Field2::from_fn(grid.cell_grid(), |x, _y| x as f32 - 2.0);
+        let velocity = MacVelocity2::new(grid, Vec2::zero());
+        let flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
+        let params = LevelSetParams {
+            dt: 0.1,
+            cfl: 0.5,
+            viscosity: 0.0,
+            pressure_iters: 0,
+            pressure_tol: 0.0,
+            advection: AdvectionScheme::SemiLagrangian,
+            boundaries: BoundaryConfig::no_slip(),
+            body_force: Vec2::zero(),
+            surface_tension: 0.0,
+            surface_tension_band: 0.0,
+            reinit_iters: 0,
+            reinit_dt: 0.0,
+            extrapolation_iters: 0,
+            preserve_volume: false,
+            target_volume: 0.0,
+            volume_band: 0.0,
+        };
+        let before = phi.clone();
+        let mut scratch = LevelSetWorkspace::new(grid);
+        advect_level_set_surface_in_place(&mut phi, &velocity, &flags, params, &mut scratch);
+        let expected = enforce_phi_neumann(&before);
+        assert_eq!(phi, expected);
+    }
+
+    #[test]
     fn enforce_phi_neumann_copies_interior_to_boundary() {
         let grid = Grid2::new(4, 4, 1.0);
         let phi = Field2::from_fn(grid, |x, y| (x + y * 10) as f32);
@@ -621,5 +979,60 @@ mod tests {
         assert_close(enforced.get(3, 2), phi.get(2, 2), 1e-6);
         assert_close(enforced.get(2, 0), phi.get(2, 1), 1e-6);
         assert_close(enforced.get(1, 3), phi.get(1, 2), 1e-6);
+    }
+
+    #[test]
+    fn level_set_step_in_place_matches_step() {
+        let grid = MacGrid2::new(6, 6, 1.0);
+        let phi = Field2::from_fn(grid.cell_grid(), |x, y| (y as f32 - 2.5) + x as f32 * 0.02);
+        let velocity = MacVelocity2::new(grid, Vec2::new(0.25, -0.1));
+        let flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
+        let params = LevelSetParams {
+            dt: 0.05,
+            cfl: 0.5,
+            viscosity: 0.01,
+            pressure_iters: 10,
+            pressure_tol: 1e-5,
+            advection: AdvectionScheme::SemiLagrangian,
+            boundaries: BoundaryConfig::no_slip(),
+            body_force: Vec2::new(0.0, -1.0),
+            surface_tension: 0.0,
+            surface_tension_band: 0.0,
+            reinit_iters: 1,
+            reinit_dt: 0.2,
+            extrapolation_iters: 0,
+            preserve_volume: false,
+            target_volume: 0.0,
+            volume_band: 0.0,
+        };
+        let state = LevelSetState {
+            phi: phi.clone(),
+            velocity: velocity.clone(),
+            flags: flags.clone(),
+        };
+        let mut in_place = LevelSetState { phi, velocity, flags };
+        let mut workspace = LevelSetWorkspace::new(grid);
+        level_set_step_in_place(&mut in_place, params, &mut workspace);
+        let stepped = level_set_step(&state, params);
+        let phi_diff = Field2::from_fn(grid.cell_grid(), |x, y| {
+            (in_place.phi.get(x, y) - stepped.phi.get(x, y)).abs()
+        })
+        .sum();
+        assert!(phi_diff < 1e-5);
+        let u_diff = in_place
+            .velocity
+            .u()
+            .map_with_index(|x, y, _| {
+                in_place.velocity.u().get(x, y) - stepped.velocity.u().get(x, y)
+            })
+            .abs_sum();
+        let v_diff = in_place
+            .velocity
+            .v()
+            .map_with_index(|x, y, _| {
+                in_place.velocity.v().get(x, y) - stepped.velocity.v().get(x, y)
+            })
+            .abs_sum();
+        assert!(u_diff + v_diff < 1e-5);
     }
 }

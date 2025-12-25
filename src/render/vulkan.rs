@@ -67,7 +67,7 @@ impl VulkanApp {
                 .context("enumerate required extensions")?;
         let create_info = vk::InstanceCreateInfo::builder()
             .application_info(&app_info)
-            .enabled_extension_names(&extension_names);
+            .enabled_extension_names(extension_names);
         let instance = unsafe {
             entry
                 .create_instance(&create_info, None)
@@ -600,13 +600,31 @@ layout(set = 0, binding = 0) uniform sampler2D u_tex;
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
 void main() {
-    float v = texture(u_tex, vec2(v_uv.x, 1.0 - v_uv.y)).r;
-    float mask = smoothstep(0.37, 0.43, v);
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    vec2 texel = 1.0 / vec2(textureSize(u_tex, 0));
+    float h = texture(u_tex, uv).r;
+    float hL = texture(u_tex, uv - vec2(texel.x, 0.0)).r;
+    float hR = texture(u_tex, uv + vec2(texel.x, 0.0)).r;
+    float hD = texture(u_tex, uv - vec2(0.0, texel.y)).r;
+    float hU = texture(u_tex, uv + vec2(0.0, texel.y)).r;
+    vec2 grad = vec2(hR - hL, hU - hD);
+    vec3 normal = normalize(vec3(-grad * 4.0, 1.0));
+    vec3 light_dir = normalize(vec3(0.4, 0.6, 1.0));
+    float diff = clamp(dot(normal, light_dir), 0.0, 1.0);
+    float height = h - 0.5;
+    float depth = clamp(0.5 - height * 1.5, 0.0, 1.0);
+    vec3 deep = vec3(0.02, 0.07, 0.14);
+    vec3 shallow = vec3(0.10, 0.45, 0.75);
+    vec3 base = mix(shallow, deep, depth);
+    vec3 view_dir = vec3(0.0, 0.0, 1.0);
+    vec3 half_dir = normalize(light_dir + view_dir);
+    float spec = pow(max(dot(normal, half_dir), 0.0), 64.0);
+    float foam = smoothstep(0.04, 0.12, length(grad) * 2.0);
+    vec3 color = base * (0.55 + 0.45 * diff) + vec3(0.85) * spec;
+    color = mix(color, vec3(0.9, 0.95, 1.0), foam * 0.4);
+    float air_mask = smoothstep(0.02, 0.08, h);
     vec3 air = vec3(0.03, 0.05, 0.08);
-    vec3 water = vec3(0.08, 0.35, 0.65);
-    vec3 color = mix(air, water, mask);
-    float edge = clamp(length(vec2(dFdx(v), dFdy(v))) * 6.0, 0.0, 1.0);
-    color += edge * vec3(0.05, 0.08, 0.12);
+    color = mix(air, color, air_mask);
     o_color = vec4(color, 1.0);
 }
 "#;
@@ -901,6 +919,7 @@ fn create_upload_sync(device: &ash::Device) -> Result<(vk::Semaphore, vk::Fence)
     Ok((semaphore, fence))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_image(
     instance: &ash::Instance,
     device: &ash::Device,
@@ -1206,6 +1225,7 @@ fn layout_transition_params(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upload_texture_data(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -1248,6 +1268,7 @@ fn upload_texture_data(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upload_texture_data_blocking(
     device: &ash::Device,
     command_pool: vk::CommandPool,
@@ -1382,6 +1403,7 @@ fn create_command_pool(device: &ash::Device, queue_family_index: u32) -> Result<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_command_buffers(
     device: &ash::Device,
     command_pool: vk::CommandPool,

@@ -3,6 +3,7 @@ pub const GLYPH_HEIGHT: usize = 5;
 pub const GLYPH_SPACING: usize = 1;
 pub const LINE_SPACING: usize = 2;
 
+#[allow(clippy::too_many_arguments)]
 pub fn overlay_text(
     buffer: &mut [u8],
     width: usize,
@@ -23,6 +24,7 @@ pub fn overlay_text(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_glyph(
     buffer: &mut [u8],
     width: usize,

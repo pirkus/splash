@@ -7,7 +7,14 @@ pub struct VecField2 {
 }
 
 impl VecField2 {
-    pub fn from_fn(grid: Grid2, f: impl Fn(usize, usize) -> Vec2) -> Self {
+    pub fn new(grid: Grid2, fill: Vec2) -> Self {
+        Self {
+            u: Field2::new(grid, fill.x),
+            v: Field2::new(grid, fill.y),
+        }
+    }
+
+    pub fn from_fn(grid: Grid2, f: impl Fn(usize, usize) -> Vec2 + Sync) -> Self {
         let u = Field2::from_fn(grid, |x, y| f(x, y).x);
         let v = Field2::from_fn(grid, |x, y| f(x, y).y);
         Self { u, v }
@@ -23,6 +30,14 @@ impl VecField2 {
 
     pub fn v(&self) -> &Field2 {
         &self.v
+    }
+
+    pub fn u_mut(&mut self) -> &mut Field2 {
+        &mut self.u
+    }
+
+    pub fn v_mut(&mut self) -> &mut Field2 {
+        &mut self.v
     }
 
     pub fn sample_linear(&self, pos: (f32, f32)) -> Vec2 {

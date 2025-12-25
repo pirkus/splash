@@ -1,4 +1,28 @@
 use crate::grid::Grid2;
+use rayon::prelude::*;
+use std::sync::OnceLock;
+
+const PAR_THRESHOLD_DEFAULT: usize = 262_144;
+const PAR_MIN_WORK_PER_THREAD: usize = 4096;
+
+fn parallel_threshold() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("SIM_PAR_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(PAR_THRESHOLD_DEFAULT)
+    })
+}
+
+fn should_parallel(len: usize) -> bool {
+    if len < parallel_threshold() {
+        return false;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    len / threads >= PAR_MIN_WORK_PER_THREAD
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Field2 {
@@ -12,15 +36,22 @@ impl Field2 {
         Self { grid, data }
     }
 
-    pub fn from_fn(grid: Grid2, f: impl Fn(usize, usize) -> f32) -> Self {
+    pub fn from_fn(grid: Grid2, f: impl Fn(usize, usize) -> f32 + Sync) -> Self {
         let width = grid.width();
-        let data = (0..grid.size())
-            .map(|i| {
+        let mut data = vec![0.0; grid.size()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut().enumerate().for_each(|(i, value)| {
                 let x = i % width;
                 let y = i / width;
-                f(x, y)
-            })
-            .collect();
+                *value = f(x, y);
+            });
+        } else {
+            for (i, value) in data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y);
+            }
+        }
         Self { grid, data }
     }
 
@@ -56,75 +87,251 @@ impl Field2 {
         vx0 + (vx1 - vx0) * sy
     }
 
-    pub fn map(&self, f: impl Fn(f32) -> f32) -> Self {
-        let data = self.data.iter().map(|value| f(*value)).collect();
+    pub fn map(&self, f: impl Fn(f32) -> f32 + Sync) -> Self {
+        let mut data = vec![0.0; self.data.len()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut().enumerate().for_each(|(i, value)| {
+                *value = f(self.data[i]);
+            });
+        } else {
+            for (value, src) in data.iter_mut().zip(self.data.iter()) {
+                *value = f(*src);
+            }
+        }
         Self {
             grid: self.grid,
             data,
         }
     }
 
-    pub fn map_with_index(&self, f: impl Fn(usize, usize, f32) -> f32) -> Self {
+    pub fn map_with_index(&self, f: impl Fn(usize, usize, f32) -> f32 + Sync) -> Self {
         let width = self.grid.width();
-        let data = self
-            .data
-            .iter()
-            .enumerate()
-            .map(|(i, value)| {
+        let mut data = vec![0.0; self.data.len()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut().enumerate().for_each(|(i, value)| {
                 let x = i % width;
                 let y = i / width;
-                f(x, y, *value)
-            })
-            .collect();
+                *value = f(x, y, self.data[i]);
+            });
+        } else {
+            for (i, value) in data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y, self.data[i]);
+            }
+        }
         Self {
             grid: self.grid,
             data,
         }
     }
 
-    pub fn fill_with_index(&mut self, f: impl Fn(usize, usize) -> f32) {
+    pub fn fill_with_index(&mut self, f: impl Fn(usize, usize) -> f32 + Sync) {
         let width = self.grid.width();
-        for (i, value) in self.data.iter_mut().enumerate() {
-            let x = i % width;
-            let y = i / width;
-            *value = f(x, y);
+        if should_parallel(self.data.len()) {
+            self.data.par_iter_mut().enumerate().for_each(|(i, value)| {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y);
+            });
+        } else {
+            for (i, value) in self.data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y);
+            }
         }
+    }
+
+    pub fn fill_with_index_and_dot(
+        &mut self,
+        dot_with: &Self,
+        f: impl Fn(usize, usize) -> f32 + Sync,
+    ) -> f32 {
+        self.assert_same_grid(dot_with);
+        let width = self.grid.width();
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, value)| {
+                    let x = i % width;
+                    let y = i / width;
+                    let next = f(x, y);
+                    *value = next;
+                    next * dot_with.data[i]
+                })
+                .sum()
+        } else {
+            let mut dot = 0.0;
+            for (i, value) in self.data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                let next = f(x, y);
+                *value = next;
+                dot += next * dot_with.data[i];
+            }
+            dot
+        }
+    }
+
+    pub fn update_with_index(&mut self, f: impl Fn(usize, usize, f32) -> f32 + Sync) {
+        let width = self.grid.width();
+        if should_parallel(self.data.len()) {
+            self.data.par_iter_mut().enumerate().for_each(|(i, value)| {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y, *value);
+            });
+        } else {
+            for (i, value) in self.data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y, *value);
+            }
+        }
+    }
+
+    pub fn clone_from(&mut self, other: &Self) {
+        self.assert_same_grid(other);
+        self.data.clone_from(&other.data);
     }
 
     pub fn scale_in_place(&mut self, scale: f32) {
-        for value in &mut self.data {
-            *value *= scale;
+        if should_parallel(self.data.len()) {
+            self.data.par_iter_mut().for_each(|value| {
+                *value *= scale;
+            });
+        } else {
+            for value in &mut self.data {
+                *value *= scale;
+            }
         }
     }
 
     pub fn add_scaled_in_place(&mut self, other: &Self, scale: f32) {
         self.assert_same_grid(other);
-        for (value, other_value) in self.data.iter_mut().zip(other.data.iter()) {
-            *value += other_value * scale;
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter_mut()
+                .zip(other.data.par_iter())
+                .for_each(|(value, other_value)| {
+                    *value += *other_value * scale;
+                });
+        } else {
+            for (value, other_value) in self.data.iter_mut().zip(other.data.iter()) {
+                *value += other_value * scale;
+            }
+        }
+    }
+
+    pub fn add_scaled_in_place_and_sum_sq(&mut self, other: &Self, scale: f32) -> f32 {
+        self.assert_same_grid(other);
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter_mut()
+                .zip(other.data.par_iter())
+                .map(|(value, other_value)| {
+                    *value += *other_value * scale;
+                    *value * *value
+                })
+                .sum()
+        } else {
+            let mut sum = 0.0;
+            for (value, other_value) in self.data.iter_mut().zip(other.data.iter()) {
+                *value += other_value * scale;
+                sum += *value * *value;
+            }
+            sum
+        }
+    }
+
+    pub fn scale_and_add_in_place(&mut self, scale: f32, other: &Self) {
+        self.assert_same_grid(other);
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter_mut()
+                .zip(other.data.par_iter())
+                .for_each(|(value, other_value)| {
+                    *value = *value * scale + *other_value;
+                });
+        } else {
+            for (value, other_value) in self.data.iter_mut().zip(other.data.iter()) {
+                *value = *value * scale + other_value;
+            }
         }
     }
 
     pub fn mul_pointwise_into(&mut self, left: &Self, right: &Self) {
         left.assert_same_grid(right);
         self.assert_same_grid(left);
-        for ((out, left_value), right_value) in self
-            .data
-            .iter_mut()
-            .zip(left.data.iter())
-            .zip(right.data.iter())
-        {
-            *out = left_value * right_value;
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter_mut()
+                .zip(left.data.par_iter())
+                .zip(right.data.par_iter())
+                .for_each(|((out, left_value), right_value)| {
+                    *out = *left_value * *right_value;
+                });
+        } else {
+            for ((out, left_value), right_value) in self
+                .data
+                .iter_mut()
+                .zip(left.data.iter())
+                .zip(right.data.iter())
+            {
+                *out = left_value * right_value;
+            }
         }
     }
 
-    pub fn zip_with(&self, other: &Self, f: impl Fn(f32, f32) -> f32) -> Self {
+    pub fn mul_pointwise_into_and_dot_left(&mut self, left: &Self, right: &Self) -> f32 {
+        left.assert_same_grid(right);
+        self.assert_same_grid(left);
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter_mut()
+                .zip(left.data.par_iter())
+                .zip(right.data.par_iter())
+                .map(|((out, left_value), right_value)| {
+                    *out = *left_value * *right_value;
+                    *left_value * *out
+                })
+                .sum()
+        } else {
+            let mut dot = 0.0;
+            for ((out, left_value), right_value) in self
+                .data
+                .iter_mut()
+                .zip(left.data.iter())
+                .zip(right.data.iter())
+            {
+                *out = left_value * right_value;
+                dot += left_value * *out;
+            }
+            dot
+        }
+    }
+
+    pub fn zip_with(&self, other: &Self, f: impl Fn(f32, f32) -> f32 + Sync) -> Self {
         self.assert_same_grid(other);
-        let data = self
-            .data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| f(*a, *b))
-            .collect();
+        let mut data = vec![0.0; self.data.len()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut()
+                .zip(self.data.par_iter())
+                .zip(other.data.par_iter())
+                .for_each(|((out, left), right)| {
+                    *out = f(*left, *right);
+                });
+        } else {
+            for ((out, left), right) in data
+                .iter_mut()
+                .zip(self.data.iter())
+                .zip(other.data.iter())
+            {
+                *out = f(*left, *right);
+            }
+        }
         Self {
             grid: self.grid,
             data,
@@ -146,16 +353,28 @@ impl Field2 {
         self.zip_with(other, |a, b| a + b * scale)
     }
 
-    pub fn sum_with(&self, f: impl Fn(f32) -> f32) -> f32 {
-        self.data.iter().map(|value| f(*value)).sum()
+    pub fn sum_with(&self, f: impl Fn(f32) -> f32 + Sync) -> f32 {
+        if should_parallel(self.data.len()) {
+            self.data.par_iter().map(|value| f(*value)).sum()
+        } else {
+            self.data.iter().map(|value| f(*value)).sum()
+        }
     }
 
     pub fn sum(&self) -> f32 {
-        self.data.iter().sum()
+        if should_parallel(self.data.len()) {
+            self.data.par_iter().sum()
+        } else {
+            self.data.iter().sum()
+        }
     }
 
     pub fn abs_sum(&self) -> f32 {
-        self.data.iter().map(|value| value.abs()).sum()
+        if should_parallel(self.data.len()) {
+            self.data.par_iter().map(|value| value.abs()).sum()
+        } else {
+            self.data.iter().map(|value| value.abs()).sum()
+        }
     }
 
     pub fn min_max(&self) -> (f32, f32) {
@@ -176,13 +395,48 @@ impl Field2 {
         (min_value, max_value)
     }
 
+    pub fn stats(&self) -> (f32, f32, f32, usize) {
+        let mut sum = 0.0;
+        let mut min_value = f32::INFINITY;
+        let mut max_value = f32::NEG_INFINITY;
+        let mut non_finite = 0;
+        for value in &self.data {
+            if value.is_finite() {
+                sum += value;
+                if *value < min_value {
+                    min_value = *value;
+                }
+                if *value > max_value {
+                    max_value = *value;
+                }
+            } else {
+                non_finite += 1;
+            }
+        }
+        if min_value == f32::INFINITY {
+            min_value = 0.0;
+        }
+        if max_value == f32::NEG_INFINITY {
+            max_value = 0.0;
+        }
+        (sum, min_value, max_value, non_finite)
+    }
+
     pub fn dot(&self, other: &Self) -> f32 {
         self.assert_same_grid(other);
-        self.data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| a * b)
-            .sum()
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter()
+                .zip(other.data.par_iter())
+                .map(|(a, b)| a * b)
+                .sum()
+        } else {
+            self.data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(a, b)| a * b)
+                .sum()
+        }
     }
 
     fn assert_same_grid(&self, other: &Self) {
@@ -263,5 +517,74 @@ mod tests {
         let field = Field2::from_fn(grid, |x, y| (x + y) as f32);
         let sum = field.sum_with(|value| value * 2.0);
         assert_close(sum, 8.0, 1e-6);
+    }
+
+    #[test]
+    fn stats_reports_min_max_sum_and_non_finite() {
+        let grid = Grid2::new(2, 2, 1.0);
+        let field = Field2::from_fn(grid, |x, y| (x + y) as f32);
+        let (sum, min_value, max_value, non_finite) = field.stats();
+        assert_close(sum, 4.0, 1e-6);
+        assert_close(min_value, 0.0, 1e-6);
+        assert_close(max_value, 2.0, 1e-6);
+        assert_eq!(non_finite, 0);
+    }
+
+    #[test]
+    fn fill_with_index_and_dot_matches_manual() {
+        let grid = Grid2::new(2, 2, 1.0);
+        let dot_with = Field2::from_fn(grid, |x, y| (x + 1 + y * 2) as f32);
+        let mut out = Field2::new(grid, 0.0);
+        let dot = out.fill_with_index_and_dot(&dot_with, |x, y| (x + y) as f32);
+        let manual = out
+            .data
+            .iter()
+            .zip(dot_with.data.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        assert_close(dot, manual, 1e-6);
+    }
+
+    #[test]
+    fn add_scaled_in_place_and_sum_sq_matches_manual() {
+        let grid = Grid2::new(2, 2, 1.0);
+        let base = Field2::from_fn(grid, |x, y| (x + y * 2) as f32);
+        let delta = Field2::from_fn(grid, |x, y| (x * 2 + y) as f32);
+        let mut out = base.clone();
+        let sum_sq = out.add_scaled_in_place_and_sum_sq(&delta, 0.5);
+        let manual: f32 = out.data.iter().map(|value| value * value).sum();
+        assert_close(sum_sq, manual, 1e-6);
+    }
+
+    #[test]
+    fn scale_and_add_in_place_matches_manual() {
+        let grid = Grid2::new(2, 2, 1.0);
+        let base = Field2::from_fn(grid, |x, y| (x + y) as f32);
+        let add = Field2::from_fn(grid, |x, y| (x + 2 * y) as f32);
+        let mut out = base.clone();
+        out.scale_and_add_in_place(0.25, &add);
+        let expected = base
+            .data
+            .iter()
+            .zip(add.data.iter())
+            .map(|(a, b)| *a * 0.25 + *b)
+            .collect::<Vec<_>>();
+        assert_eq!(out.data, expected);
+    }
+
+    #[test]
+    fn mul_pointwise_into_and_dot_left_matches_manual() {
+        let grid = Grid2::new(2, 2, 1.0);
+        let left = Field2::from_fn(grid, |x, y| (x + y * 2) as f32);
+        let right = Field2::from_fn(grid, |x, y| (x * 3 + y + 1) as f32);
+        let mut out = Field2::new(grid, 0.0);
+        let dot = out.mul_pointwise_into_and_dot_left(&left, &right);
+        let manual: f32 = left
+            .data
+            .iter()
+            .zip(out.data.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        assert_close(dot, manual, 1e-6);
     }
 }

@@ -1,4 +1,28 @@
 use crate::{Grid2, Vec2};
+use rayon::prelude::*;
+use std::sync::OnceLock;
+
+const PAR_THRESHOLD_DEFAULT: usize = 262_144;
+const PAR_MIN_WORK_PER_THREAD: usize = 4096;
+
+fn parallel_threshold() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("SIM_PAR_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(PAR_THRESHOLD_DEFAULT)
+    })
+}
+
+fn should_parallel(len: usize) -> bool {
+    if len < parallel_threshold() {
+        return false;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    len / threads >= PAR_MIN_WORK_PER_THREAD
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MacGrid2 {
@@ -131,15 +155,22 @@ impl StaggeredField2 {
         Self { grid, data }
     }
 
-    pub fn from_fn(grid: StaggeredGrid2, f: impl Fn(usize, usize) -> f32) -> Self {
+    pub fn from_fn(grid: StaggeredGrid2, f: impl Fn(usize, usize) -> f32 + Sync) -> Self {
         let width = grid.width();
-        let data = (0..grid.size())
-            .map(|i| {
+        let mut data = vec![0.0; grid.size()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut().enumerate().for_each(|(i, value)| {
                 let x = i % width;
                 let y = i / width;
-                f(x, y)
-            })
-            .collect();
+                *value = f(x, y);
+            });
+        } else {
+            for (i, value) in data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y);
+            }
+        }
         Self { grid, data }
     }
 
@@ -176,32 +207,86 @@ impl StaggeredField2 {
         vx0 + (vx1 - vx0) * sy
     }
 
-    pub fn map_with_index(&self, f: impl Fn(usize, usize, f32) -> f32) -> Self {
+    pub fn map_with_index(&self, f: impl Fn(usize, usize, f32) -> f32 + Sync) -> Self {
         let width = self.grid.width();
-        let data = self
-            .data
-            .iter()
-            .enumerate()
-            .map(|(i, value)| {
+        let mut data = vec![0.0; self.data.len()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut().enumerate().for_each(|(i, value)| {
                 let x = i % width;
                 let y = i / width;
-                f(x, y, *value)
-            })
-            .collect();
+                *value = f(x, y, self.data[i]);
+            });
+        } else {
+            for (i, value) in data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y, self.data[i]);
+            }
+        }
         Self {
             grid: self.grid,
             data,
         }
     }
 
-    pub fn zip_with(&self, other: &Self, f: impl Fn(f32, f32) -> f32) -> Self {
+    pub fn fill_with_index(&mut self, f: impl Fn(usize, usize) -> f32 + Sync) {
+        let width = self.grid.width();
+        if should_parallel(self.data.len()) {
+            self.data.par_iter_mut().enumerate().for_each(|(i, value)| {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y);
+            });
+        } else {
+            for (i, value) in self.data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y);
+            }
+        }
+    }
+
+    pub fn update_with_index(&mut self, f: impl Fn(usize, usize, f32) -> f32 + Sync) {
+        let width = self.grid.width();
+        if should_parallel(self.data.len()) {
+            self.data.par_iter_mut().enumerate().for_each(|(i, value)| {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y, *value);
+            });
+        } else {
+            for (i, value) in self.data.iter_mut().enumerate() {
+                let x = i % width;
+                let y = i / width;
+                *value = f(x, y, *value);
+            }
+        }
+    }
+
+    pub fn clone_from(&mut self, other: &Self) {
         assert_eq!(self.grid, other.grid, "staggered grid mismatch");
-        let data = self
-            .data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| f(*a, *b))
-            .collect();
+        self.data.clone_from(&other.data);
+    }
+
+    pub fn zip_with(&self, other: &Self, f: impl Fn(f32, f32) -> f32 + Sync) -> Self {
+        assert_eq!(self.grid, other.grid, "staggered grid mismatch");
+        let mut data = vec![0.0; self.data.len()];
+        if should_parallel(data.len()) {
+            data.par_iter_mut()
+                .zip(self.data.par_iter())
+                .zip(other.data.par_iter())
+                .for_each(|((out, left), right)| {
+                    *out = f(*left, *right);
+                });
+        } else {
+            for ((out, left), right) in data
+                .iter_mut()
+                .zip(self.data.iter())
+                .zip(other.data.iter())
+            {
+                *out = f(*left, *right);
+            }
+        }
         Self {
             grid: self.grid,
             data,
@@ -224,22 +309,44 @@ impl StaggeredField2 {
     }
 
     pub fn sum(&self) -> f32 {
-        self.data.iter().sum()
+        if should_parallel(self.data.len()) {
+            self.data.par_iter().sum()
+        } else {
+            self.data.iter().sum()
+        }
     }
 
     pub fn abs_sum(&self) -> f32 {
-        self.data.iter().map(|value| value.abs()).sum()
+        if should_parallel(self.data.len()) {
+            self.data.par_iter().map(|value| value.abs()).sum()
+        } else {
+            self.data.iter().map(|value| value.abs()).sum()
+        }
     }
 
     pub fn max_abs(&self) -> f32 {
-        self.data
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f32, f32::max)
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter()
+                .map(|value| value.abs())
+                .reduce(|| 0.0_f32, f32::max)
+        } else {
+            self.data
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f32, f32::max)
+        }
     }
 
     pub fn sum_squares(&self) -> f32 {
-        self.data.iter().map(|value| value * value).sum()
+        if should_parallel(self.data.len()) {
+            self.data
+                .par_iter()
+                .map(|value| value * value)
+                .sum()
+        } else {
+            self.data.iter().map(|value| value * value).sum()
+        }
     }
 }
 
@@ -281,6 +388,20 @@ impl CellFlags {
     pub fn get(&self, x: usize, y: usize) -> CellType {
         self.data[self.grid.idx(x, y)]
     }
+
+    pub fn clone_from(&mut self, other: &Self) {
+        assert_eq!(self.grid, other.grid, "cell flag grid mismatch");
+        self.data.clone_from(&other.data);
+    }
+
+    pub fn fill_with_index(&mut self, f: impl Fn(usize, usize) -> CellType) {
+        let width = self.grid.width();
+        for (i, value) in self.data.iter_mut().enumerate() {
+            let x = i % width;
+            let y = i / width;
+            *value = f(x, y);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -313,6 +434,19 @@ impl MacVelocity2 {
 
     pub fn v(&self) -> &StaggeredField2 {
         &self.v
+    }
+
+    pub fn u_mut(&mut self) -> &mut StaggeredField2 {
+        &mut self.u
+    }
+
+    pub fn v_mut(&mut self) -> &mut StaggeredField2 {
+        &mut self.v
+    }
+
+    pub fn clone_from(&mut self, other: &Self) {
+        self.u.clone_from(&other.u);
+        self.v.clone_from(&other.v);
     }
 
     pub fn sample_linear(&self, pos: (f32, f32)) -> Vec2 {
@@ -457,6 +591,105 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
     MacVelocity2::from_components(grid, u, v)
 }
 
+pub fn apply_domain_boundaries_into(
+    out: &mut MacVelocity2,
+    velocity: &MacVelocity2,
+    config: BoundaryConfig,
+) {
+    debug_assert_eq!(out.grid(), velocity.grid(), "velocity grid mismatch");
+    let grid = velocity.grid();
+    let w = grid.width();
+    let h = grid.height();
+    let u_field = velocity.u();
+    let v_field = velocity.v();
+    out.u_mut().fill_with_index(|x, y| {
+        if x == 0 {
+            return match config.left {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.x,
+                BoundaryCondition::Outflow => u_field.get(1, y),
+            };
+        }
+        if x == w {
+            return match config.right {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.x,
+                BoundaryCondition::Outflow => u_field.get(w - 1, y),
+            };
+        }
+        if y == 0 {
+            return match config.bottom {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.x,
+                BoundaryCondition::Outflow => {
+                    if h > 1 {
+                        u_field.get(x, 1)
+                    } else {
+                        u_field.get(x, y)
+                    }
+                }
+            };
+        }
+        if y + 1 == h {
+            return match config.top {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.x,
+                BoundaryCondition::Outflow => {
+                    if h > 1 {
+                        u_field.get(x, h - 2)
+                    } else {
+                        u_field.get(x, y)
+                    }
+                }
+            };
+        }
+        u_field.get(x, y)
+    });
+    out.v_mut().fill_with_index(|x, y| {
+        if y == 0 {
+            return match config.bottom {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.y,
+                BoundaryCondition::Outflow => v_field.get(x, 1),
+            };
+        }
+        if y == h {
+            return match config.top {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.y,
+                BoundaryCondition::Outflow => v_field.get(x, h - 1),
+            };
+        }
+        if x == 0 {
+            return match config.left {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.y,
+                BoundaryCondition::Outflow => {
+                    if w > 1 {
+                        v_field.get(1, y)
+                    } else {
+                        v_field.get(x, y)
+                    }
+                }
+            };
+        }
+        if x + 1 == w {
+            return match config.right {
+                BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Inflow(v) => v.y,
+                BoundaryCondition::Outflow => {
+                    if w > 1 {
+                        v_field.get(w - 2, y)
+                    } else {
+                        v_field.get(x, y)
+                    }
+                }
+            };
+        }
+        v_field.get(x, y)
+    });
+}
+
 pub fn apply_solid_boundaries(velocity: &MacVelocity2, flags: &CellFlags) -> MacVelocity2 {
     assert_eq!(flags.grid(), velocity.grid().cell_grid(), "cell grid mismatch");
     let grid = velocity.grid();
@@ -497,6 +730,54 @@ pub fn apply_solid_boundaries(velocity: &MacVelocity2, flags: &CellFlags) -> Mac
         }
     });
     MacVelocity2::from_components(grid, u, v)
+}
+
+pub fn apply_solid_boundaries_into(
+    out: &mut MacVelocity2,
+    velocity: &MacVelocity2,
+    flags: &CellFlags,
+) {
+    debug_assert_eq!(flags.grid(), velocity.grid().cell_grid(), "cell grid mismatch");
+    debug_assert_eq!(out.grid(), velocity.grid(), "velocity grid mismatch");
+    let grid = velocity.grid();
+    let w = grid.width();
+    let h = grid.height();
+    let u_field = velocity.u();
+    let v_field = velocity.v();
+    out.u_mut().fill_with_index(|x, y| {
+        let left_solid = if x == 0 {
+            true
+        } else {
+            flags.get(x - 1, y) == CellType::Solid
+        };
+        let right_solid = if x == w {
+            true
+        } else {
+            flags.get(x, y) == CellType::Solid
+        };
+        if left_solid || right_solid {
+            0.0
+        } else {
+            u_field.get(x, y)
+        }
+    });
+    out.v_mut().fill_with_index(|x, y| {
+        let bottom_solid = if y == 0 {
+            true
+        } else {
+            flags.get(x, y - 1) == CellType::Solid
+        };
+        let top_solid = if y == h {
+            true
+        } else {
+            flags.get(x, y) == CellType::Solid
+        };
+        if bottom_solid || top_solid {
+            0.0
+        } else {
+            v_field.get(x, y)
+        }
+    });
 }
 
 #[cfg(test)]
