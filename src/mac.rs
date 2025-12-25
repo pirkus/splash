@@ -155,6 +155,11 @@ impl StaggeredField2 {
         Self { grid, data }
     }
 
+    pub fn from_data(grid: StaggeredGrid2, data: Vec<f32>) -> Self {
+        assert_eq!(data.len(), grid.size(), "staggered field data mismatch");
+        Self { grid, data }
+    }
+
     pub fn from_fn(grid: StaggeredGrid2, f: impl Fn(usize, usize) -> f32 + Sync) -> Self {
         let width = grid.width();
         let mut data = vec![0.0; grid.size()];

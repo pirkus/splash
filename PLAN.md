@@ -39,13 +39,13 @@ Status legend: [x] done, [~] in progress, [ ] not started
 2. [x] Add vorticity confinement (optional for visual detail).
 3. [x] Implement multigrid pressure solve.
 4. [x] Add boundary-aware advection (solid obstacles).
-5. [ ] Regression tests for conservation and stability.
+5. [x] Regression tests for conservation and stability.
 
 ## Phase 4: FLIP/APIC CPU Water Solver (2D)
-1. [ ] Add particle storage (positions, velocities, phase tags) and seeded initial pool.
-2. [ ] Implement PIC/FLIP/APIC transfers (P2G, G2P) on MAC grid.
-3. [ ] Integrate particles (RK2/RK3 advection) with boundary handling.
-4. [ ] Pressure projection on the grid (reuse existing solver, tuned for liquid region).
+1. [x] Add particle storage (positions, velocities, phase tags) and seeded initial pool.
+2. [x] Implement PIC/FLIP/APIC transfers (P2G, G2P) on MAC grid.
+3. [x] Integrate particles (RK2/RK3 advection) with boundary handling.
+4. [x] Pressure projection on the grid (reuse existing solver, tuned for liquid region).
 5. [ ] Surface reconstruction for rendering (splash sheet, density/level set from particles).
 6. [ ] Add drop injection and interaction controls (click to add droplets).
 7. [ ] Add validation cases (dam break, drop impact, volume conservation).

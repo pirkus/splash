@@ -1366,7 +1366,14 @@ fn sharpen_density_into(out: &mut Field2, density: &Field2, threshold: f32, band
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{StaggeredField2};
+    use crate::{BoundaryConfig, StaggeredField2};
+
+    fn assert_close(a: f32, b: f32, tol: f32) {
+        assert!(
+            (a - b).abs() <= tol,
+            "expected {a} to be within {tol} of {b}"
+        );
+    }
 
     #[test]
     fn multigrid_projection_reduces_divergence() {
@@ -1394,5 +1401,55 @@ mod tests {
         divergence_into(&mut divergence, &projected);
         let after = divergence.abs_sum();
         assert!(after < before);
+    }
+
+    #[test]
+    fn free_surface_preserves_mass_with_multigrid() {
+        let grid = MacGrid2::new(32, 32, 1.0);
+        let cutoff = (grid.height() as f32 * 0.5).round() as usize;
+        let density = Field2::from_fn(grid.cell_grid(), |_x, y| {
+            if y < cutoff { 1.0 } else { 0.0 }
+        });
+        let velocity = MacVelocity2::new(grid, Vec2::zero());
+        let flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
+        let params = MacSimParams {
+            dt: 0.1,
+            cfl: 0.5,
+            diffusion: 0.0,
+            viscosity: 0.0,
+            vorticity_strength: 0.0,
+            pressure_iters: 10,
+            pressure_tol: 1e-5,
+            advection: AdvectionScheme::SemiLagrangian,
+            boundaries: BoundaryConfig::no_slip(),
+            body_force: Vec2::zero(),
+            buoyancy: 0.0,
+            ambient_density: 0.0,
+            surface_tension: 0.0,
+            free_surface: true,
+            density_threshold: 0.5,
+            surface_band: 0.1,
+            preserve_mass: true,
+        };
+        let mg_params = MultigridParams {
+            cycles: 3,
+            tol: 0.0,
+            final_smooth: 0,
+            pcg_iters: 0,
+            pcg_tol: 0.0,
+            ..MultigridParams::default()
+        };
+        let mut state = MacSimState {
+            density,
+            velocity,
+            flags,
+        };
+        let before = state.density.sum();
+        let mut workspace = MacSimMgWorkspace::new(grid);
+        for _ in 0..12 {
+            step_in_place_mg(&mut state, params, mg_params, &mut workspace);
+        }
+        let after = state.density.sum();
+        assert_close(after, before, 1e-2);
     }
 }

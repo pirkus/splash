@@ -1,10 +1,11 @@
 use anyhow::Result;
 use nav_stokes_sim::{
-    advect_level_set_surface_in_place, flags_from_density, flags_from_phi, level_set_step_in_place,
-    overlay_text, phi_to_density, divergence, step_in_place, step_in_place_mg, volume_from_phi,
-    AdvectionScheme, BoundaryConfig, CellFlags, CellType, Field2, LevelSetParams, LevelSetState,
-    LevelSetWorkspace, MacGrid2, MacSimMgWorkspace, MacSimParams, MacSimState, MacSimWorkspace,
-    MacVelocity2, MultigridParams, StaggeredField2, Vec2, VulkanApp, GLYPH_HEIGHT, LINE_SPACING,
+    advect_level_set_surface_in_place, apply_domain_boundaries, flags_from_density, flags_from_phi,
+    level_set_step_in_place, overlay_text, phi_to_density, divergence, project_with_flags,
+    step_in_place, step_in_place_mg, volume_from_phi, AdvectionScheme, BoundaryConfig, CellFlags,
+    CellType, Field2, LevelSetParams, LevelSetState, LevelSetWorkspace, MacGrid2, MacSimMgWorkspace,
+    MacSimParams, MacSimState, MacSimWorkspace, MacVelocity2, MultigridParams, ParticleBounds,
+    ParticlePhase, ParticleSystem, StaggeredField2, Vec2, VulkanApp, GLYPH_HEIGHT, LINE_SPACING,
 };
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -19,6 +20,7 @@ enum SimMode {
     Density,
     LevelSet,
     DensityMg,
+    Particles,
 }
 
 impl SimMode {
@@ -26,7 +28,8 @@ impl SimMode {
         match self {
             SimMode::Density => SimMode::LevelSet,
             SimMode::LevelSet => SimMode::DensityMg,
-            SimMode::DensityMg => SimMode::Density,
+            SimMode::DensityMg => SimMode::Particles,
+            SimMode::Particles => SimMode::Density,
         }
     }
 
@@ -35,6 +38,7 @@ impl SimMode {
             SimMode::Density => '1',
             SimMode::LevelSet => '2',
             SimMode::DensityMg => '3',
+            SimMode::Particles => '4',
         }
     }
 }
@@ -172,11 +176,18 @@ fn env_f32(key: &str) -> Option<f32> {
         .and_then(|value| value.parse::<f32>().ok())
 }
 
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 fn start_mode() -> SimMode {
     match std::env::var("SIM_START_MODE").ok().as_deref() {
         Some("1") => SimMode::Density,
         Some("2") => SimMode::LevelSet,
         Some("3") => SimMode::DensityMg,
+        Some("4") => SimMode::Particles,
         _ => SimMode::DensityMg,
     }
 }
@@ -594,6 +605,26 @@ fn main() -> Result<()> {
     let mut density_dye_scratch = Field2::new(grid.cell_grid(), 0.0);
     let mut density_mg_dye_scratch = Field2::new(grid.cell_grid(), 0.0);
     let dye_params = dye_params();
+    let particle_spacing = grid.dx() * 0.75;
+    let particle_jitter = 0.35;
+    let pool_height_fraction = (init.base_height / (grid.height() as f32 * grid.dx())).clamp(0.1, 0.9);
+    let mut particles =
+        ParticleSystem::seed_pool(grid, pool_height_fraction, particle_spacing, particle_jitter, ParticlePhase::Liquid);
+    let mut droplet = ParticleSystem::seed_disk(
+        Vec2::new(init.drop_center.0, init.drop_center.1),
+        init.drop_radius * 0.9,
+        particle_spacing,
+        particle_jitter,
+        ParticlePhase::Liquid,
+    );
+    droplet.add_velocity(Vec2::new(0.0, init.drop_speed));
+    particles.append(droplet);
+    let particle_bounds = ParticleBounds::from_grid(grid, grid.dx() * 0.5);
+    let mut particle_grid = MacVelocity2::new(grid, Vec2::zero());
+    let mut particle_prev_grid = MacVelocity2::new(grid, Vec2::zero());
+    let mut particle_density = Field2::new(grid.cell_grid(), 0.0);
+    let particle_rest_density = particles.rest_density(grid);
+    let particle_base_flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
     println!(
         "dye params diffusion={:.6} decay={:.6} air_decay={:.6} base={:.3} reinject={:.3}",
         dye_params.diffusion,
@@ -652,6 +683,13 @@ fn main() -> Result<()> {
         target_volume,
         volume_band: surface_band,
     };
+    let particle_dt = env_f32("SIM_PARTICLE_DT").unwrap_or(0.02);
+    let particle_flip_ratio = env_f32("SIM_FLIP_RATIO").unwrap_or(0.0);
+    let particle_bounce = env_f32("SIM_PARTICLE_BOUNCE").unwrap_or(0.0);
+    let particle_density_scale = env_f32("SIM_PARTICLE_DENSITY_SCALE").unwrap_or(1.0);
+    let particle_liquid_threshold = env_f32("SIM_PARTICLE_LIQUID_THRESHOLD").unwrap_or(0.2);
+    let particle_pressure_iters = env_usize("SIM_PARTICLE_PRESSURE_ITERS").unwrap_or(40);
+    let particle_pressure_tol = env_f32("SIM_PARTICLE_PRESSURE_TOL").unwrap_or(1e-4);
     let density_surface_params = LevelSetParams {
         dt: density_params.dt,
         cfl: density_params.cfl,
@@ -690,6 +728,7 @@ fn main() -> Result<()> {
     let mut texture = Vec::new();
     let density_steps_per_frame = 4;
     let level_steps_per_frame = 4;
+    let particle_steps_per_frame = 2;
     let mut frame_count: u64 = 0;
     let mut avg_frame_ms = 0.0;
     let mut avg_sim_ms = 0.0;
@@ -705,6 +744,7 @@ fn main() -> Result<()> {
                 SimMode::Density => density_state.density.stats(),
                 SimMode::LevelSet => level_state.phi.stats(),
                 SimMode::DensityMg => density_mg_state.density.stats(),
+                SimMode::Particles => particle_density.stats(),
             })
         } else {
             None
@@ -836,12 +876,54 @@ fn main() -> Result<()> {
                 );
                 (dt_display, density_mg_params.cfl, mg_params.cycles)
             }
+            SimMode::Particles => {
+                for _ in 0..particle_steps_per_frame {
+                    let density_flags =
+                        particles.to_density_with_rest(grid, particle_density_scale, particle_rest_density);
+                    let particle_flags = flags_from_density(
+                        &density_flags,
+                        &particle_base_flags,
+                        particle_liquid_threshold,
+                    );
+                    particle_grid = particles.to_grid(grid);
+                    particle_grid =
+                        apply_domain_boundaries(&particle_grid, BoundaryConfig::no_slip());
+                    particle_grid.v_mut().update_with_index(|_x, _y, value| {
+                        value + -9.8 * particle_dt
+                    });
+                    particle_prev_grid.clone_from(&particle_grid);
+                    particle_grid = project_with_flags(
+                        &particle_grid,
+                        &particle_flags,
+                        particle_pressure_iters,
+                        particle_pressure_tol,
+                    );
+                    particle_grid =
+                        apply_domain_boundaries(&particle_grid, BoundaryConfig::no_slip());
+                    particles.update_velocities_from_grid(
+                        &particle_grid,
+                        Some(&particle_prev_grid),
+                        particle_flip_ratio,
+                    );
+                    particles.advect_rk2_grid(
+                        &particle_grid,
+                        particle_dt,
+                        particle_bounds,
+                        particle_bounce,
+                    );
+                }
+                particle_density =
+                    particles.to_density_with_rest(grid, particle_density_scale, particle_rest_density);
+                density_to_luma(&particle_density, &mut texture);
+                (particle_dt, 0.0, 0)
+            }
         };
         if let Some((sum_before, min_before, max_before, non_finite_before)) = before_stats {
             let (sum_after, min_after, max_after, non_finite_after) = match mode {
                 SimMode::Density => density_state.density.stats(),
                 SimMode::LevelSet => level_state.phi.stats(),
                 SimMode::DensityMg => density_mg_state.density.stats(),
+                SimMode::Particles => particle_density.stats(),
             };
             println!(
                 "init mode={} sum={:.2}->{:.2} min={:.3}->{:.3} max={:.3}->{:.3} nonfinite={} -> {}",
@@ -906,6 +988,13 @@ fn main() -> Result<()> {
                             Some(density_mg_dye.stats()),
                             dye_center(&density_mg_dye),
                         ),
+                        SimMode::Particles => (
+                            particles.len() as f32,
+                            divergence(&particle_grid).abs_sum(),
+                            particle_grid.max_abs(),
+                            None,
+                            None,
+                        ),
                     };
             let surf_height = match mode {
                 SimMode::Density => {
@@ -915,6 +1004,7 @@ fn main() -> Result<()> {
                     surface_height_avg(&density_mg_state.density, density_threshold)
                 }
                 SimMode::LevelSet => None,
+                SimMode::Particles => None,
             };
             let surf_label = surf_height
                 .map(|value| format!(" surf_y={:.2}", value))
@@ -933,6 +1023,7 @@ fn main() -> Result<()> {
                     init.base_height,
                 ),
                 SimMode::LevelSet => None,
+                SimMode::Particles => None,
             };
             let droplet_center = match mode {
                 SimMode::Density => {
@@ -942,6 +1033,7 @@ fn main() -> Result<()> {
                     droplet_center(&density_mg_state.density, density_threshold, init.base_height)
                 }
                 SimMode::LevelSet => None,
+                SimMode::Particles => None,
             };
             let droplet_label = droplet_stats
                 .map(|(avg_vy, max_vy, count)| {
@@ -1050,6 +1142,16 @@ fn main() -> Result<()> {
                             );
                                 }
                             }
+                            SimMode::Particles => {
+                                if dump_mode == DumpField::Density || dump_mode == DumpField::Both {
+                                    dump_matrix(
+                                        "matrix particles",
+                                        *frame_count,
+                                        &particle_density,
+                                        stride,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1110,6 +1212,9 @@ fn main() -> Result<()> {
                         }
                         winit::event::VirtualKeyCode::Key3 => {
                             mode = SimMode::DensityMg;
+                        }
+                        winit::event::VirtualKeyCode::Key4 => {
+                            mode = SimMode::Particles;
                         }
                         _ => {}
                     }

@@ -5,6 +5,7 @@ mod level_set;
 mod mac;
 mod mac_sim;
 mod mac_sim_mg;
+mod particles;
 mod render;
 mod vec2;
 mod vec_field;
@@ -18,10 +19,11 @@ pub use level_set::{
     LevelSetWorkspace,
 };
 pub use mac_sim::{
-    divergence, flags_from_density, sharpen_density, step, step_in_place, AdvectionScheme,
-    MacSimParams, MacSimState, MacSimWorkspace,
+    divergence, flags_from_density, project_with_flags, sharpen_density, step, step_in_place,
+    AdvectionScheme, MacSimParams, MacSimState, MacSimWorkspace,
 };
 pub use mac_sim_mg::{step_in_place_mg, step_mg, MacSimMgWorkspace, MultigridParams};
+pub use particles::{ParticleBounds, ParticlePhase, ParticleSystem};
 pub use vec2::Vec2;
 pub use mac::{
     apply_domain_boundaries, apply_solid_boundaries, BoundaryCondition, BoundaryConfig, CellFlags,

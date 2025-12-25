@@ -2407,6 +2407,11 @@ mod tests {
         );
     }
 
+    fn pool_density(grid: MacGrid2, height_fraction: f32) -> Field2 {
+        let cutoff = (grid.height() as f32 * height_fraction).round() as usize;
+        Field2::from_fn(grid.cell_grid(), |_x, y| if y < cutoff { 1.0 } else { 0.0 })
+    }
+
     #[test]
     fn divergence_of_constant_velocity_is_zero() {
         let grid = MacGrid2::new(8, 6, 1.0);
@@ -2742,6 +2747,90 @@ mod tests {
         let evolved = (0..10).fold(state, |current, _| step(&current, params));
         let after = evolved.density.sum();
         assert_close(after, before, 1e-6);
+    }
+
+    #[test]
+    fn free_surface_preserves_mass_without_forces() {
+        let grid = MacGrid2::new(32, 32, 1.0);
+        let density = pool_density(grid, 0.5);
+        let velocity = MacVelocity2::new(grid, Vec2::zero());
+        let flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
+        let params = MacSimParams {
+            dt: 0.1,
+            cfl: 0.5,
+            diffusion: 0.0,
+            viscosity: 0.0,
+            vorticity_strength: 0.0,
+            pressure_iters: 10,
+            pressure_tol: 1e-5,
+            advection: AdvectionScheme::SemiLagrangian,
+            boundaries: BoundaryConfig::no_slip(),
+            body_force: Vec2::zero(),
+            buoyancy: 0.0,
+            ambient_density: 0.0,
+            surface_tension: 0.0,
+            free_surface: true,
+            density_threshold: 0.5,
+            surface_band: 0.1,
+            preserve_mass: true,
+        };
+        let mut state = MacSimState {
+            density,
+            velocity,
+            flags,
+        };
+        let before = state.density.sum();
+        let mut workspace = MacSimWorkspace::new(grid);
+        for _ in 0..15 {
+            step_in_place(&mut state, params, &mut workspace);
+        }
+        let after = state.density.sum();
+        assert_close(after, before, 1e-2);
+    }
+
+    #[test]
+    fn free_surface_stays_finite_over_steps() {
+        let grid = MacGrid2::new(24, 24, 1.0);
+        let density = Field2::from_fn(grid.cell_grid(), |x, y| {
+            let dx = x as f32 - 12.0;
+            let dy = y as f32 - 12.0;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < 6.0 { 1.0 } else { 0.0 }
+        });
+        let velocity = MacVelocity2::new(grid, Vec2::new(1.25, -0.75));
+        let flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
+        let params = MacSimParams {
+            dt: 0.08,
+            cfl: 0.5,
+            diffusion: 0.0,
+            viscosity: 0.0,
+            vorticity_strength: 0.0,
+            pressure_iters: 10,
+            pressure_tol: 1e-5,
+            advection: AdvectionScheme::Bfecc,
+            boundaries: BoundaryConfig::no_slip(),
+            body_force: Vec2::zero(),
+            buoyancy: 0.0,
+            ambient_density: 0.0,
+            surface_tension: 0.0,
+            free_surface: true,
+            density_threshold: 0.5,
+            surface_band: 0.1,
+            preserve_mass: false,
+        };
+        let mut state = MacSimState {
+            density,
+            velocity,
+            flags,
+        };
+        let mut workspace = MacSimWorkspace::new(grid);
+        for _ in 0..20 {
+            step_in_place(&mut state, params, &mut workspace);
+        }
+        let (_sum, min_value, max_value, non_finite) = state.density.stats();
+        assert_eq!(non_finite, 0);
+        assert!(min_value >= -1e-4);
+        assert!(max_value <= 1.0001);
     }
 
     #[test]
