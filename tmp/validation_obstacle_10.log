@@ -1,6 +1,0 @@
-init drop_speed=-20.00
-dye params diffusion=0.000000 decay=1.000000 air_decay=1.000000 base=0.450 reinject=0.000
-headless mode frames=10
-init mode=4 sum=27716.09->27713.59 min=0.000->0.000 max=1.000->1.000 nonfinite=0 -> 0
-frame 10 mode=4 sim_ms=124.22 frame_ms=124.22 fps=8.1 mass=57970.00 div=55211491328.00 vel_max=795854144.00 drop_vy=120.77 drop_vmax=200.00 drop_n=110 drop_center=(89.56,131.78) vol_raw=27772.84 vol_render=27722.97
-validation case=obstacle frames=10 vol_raw_min=27640.88 vol_loss_pct=0.27 max_div=275965804544.00 specks_avg=40.50 specks_max=54
