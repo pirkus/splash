@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::mem;
 use std::ptr;
 
 use anyhow::{anyhow, Context, Result};
@@ -7,6 +8,8 @@ use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use shaderc::ShaderKind;
 use winit::window::Window;
 
+use crate::particles::GpuParticle;
+use crate::{MacGrid2, MacVelocity2, ParticleBounds, ParticleSystem, StaggeredField2, Vec2};
 use crate::render::config::{choose_extent, choose_present_mode, choose_surface_format};
 
 #[allow(dead_code)]
@@ -49,6 +52,63 @@ pub struct VulkanApp {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight_fence: vk::Fence,
+    particle_compute: Option<ParticleCompute>,
+}
+
+const GPU_PARTICLE_WORKGROUP: u32 = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ParticleComputeParams {
+    bounds_min: [f32; 2],
+    bounds_max: [f32; 2],
+    dt: f32,
+    bounce: f32,
+    count: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ParticleGridParams {
+    dx: f32,
+    vel_scale: f32,
+    weight_scale: f32,
+    grid_w: u32,
+    grid_h: u32,
+    count: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct GridAccum {
+    sum: i32,
+    weight: i32,
+}
+
+struct ParticleCompute {
+    integrate_pipeline_layout: vk::PipelineLayout,
+    integrate_pipeline: vk::Pipeline,
+    grid_pipeline_layout: vk::PipelineLayout,
+    grid_pipeline: vk::Pipeline,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    buffer: vk::Buffer,
+    buffer_memory: vk::DeviceMemory,
+    buffer_size: vk::DeviceSize,
+    capacity: usize,
+    grid_u_buffer: vk::Buffer,
+    grid_u_memory: vk::DeviceMemory,
+    grid_u_count: usize,
+    grid_v_buffer: vk::Buffer,
+    grid_v_memory: vk::DeviceMemory,
+    grid_v_count: usize,
+    grid_w: u32,
+    grid_h: u32,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
 }
 
 impl VulkanApp {
@@ -204,6 +264,7 @@ impl VulkanApp {
             image_available,
             render_finished,
             in_flight_fence,
+            particle_compute: None,
         })
     }
 
@@ -250,6 +311,84 @@ impl VulkanApp {
         )?;
         self.texture_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         self.upload_pending = true;
+        Ok(())
+    }
+
+    pub fn update_particles_gpu(
+        &mut self,
+        particles: &mut ParticleSystem,
+        grid: MacGrid2,
+        bounds: ParticleBounds,
+        dt: f32,
+        bounce: f32,
+    ) -> Result<()> {
+        if particles.is_empty() {
+            return Ok(());
+        }
+        self.ensure_particle_compute(particles.len(), grid)?;
+        let dt = if dt.is_finite() { dt } else { 0.0 };
+        let bounce = bounce.clamp(0.0, 1.0);
+        let mut gpu_particles = particles.pack_gpu();
+        let compute = self
+            .particle_compute
+            .as_ref()
+            .ok_or_else(|| anyhow!("particle compute not initialized"))?;
+        compute.write_particles(&self.device, &gpu_particles)?;
+        compute.dispatch_integrate(&self.device, self.queue, bounds, dt, bounce, gpu_particles.len())?;
+        compute.read_particles(&self.device, &mut gpu_particles)?;
+        if !particles.unpack_gpu(&gpu_particles) {
+            return Err(anyhow!("gpu particle count mismatch"));
+        }
+        Ok(())
+    }
+
+    pub fn particle_grid_gpu(
+        &mut self,
+        particles: &ParticleSystem,
+        grid: MacGrid2,
+        scale: f32,
+    ) -> Result<MacVelocity2> {
+        if particles.is_empty() {
+            return Ok(MacVelocity2::new(grid, Vec2::zero()));
+        }
+        self.ensure_particle_compute(particles.len(), grid)?;
+        let scale = scale.max(1.0);
+        let gpu_particles = particles.pack_gpu();
+        let compute = self
+            .particle_compute
+            .as_ref()
+            .ok_or_else(|| anyhow!("particle compute not initialized"))?;
+        compute.write_particles(&self.device, &gpu_particles)?;
+        compute.dispatch_p2g(&self.device, self.queue, grid, scale, gpu_particles.len())?;
+        let (u_accum, v_accum) = compute.read_grid(&self.device)?;
+        accum_to_velocity(grid, &u_accum, &v_accum, scale)
+    }
+
+    fn ensure_particle_compute(&mut self, capacity: usize, grid: MacGrid2) -> Result<()> {
+        let needs_rebuild = self
+            .particle_compute
+            .as_ref()
+            .map(|state| {
+                capacity > state.capacity
+                    || state.grid_w != grid.width() as u32
+                    || state.grid_h != grid.height() as u32
+            })
+            .unwrap_or(true);
+        if !needs_rebuild {
+            return Ok(());
+        }
+        if let Some(state) = self.particle_compute.take() {
+            state.destroy(&self.device);
+        }
+        let state = ParticleCompute::new(
+            &self.instance,
+            &self.device,
+            self.physical_device,
+            self.command_pool,
+            capacity,
+            grid,
+        )?;
+        self.particle_compute = Some(state);
         Ok(())
     }
 
@@ -314,10 +453,509 @@ impl VulkanApp {
     }
 }
 
+impl ParticleCompute {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        capacity: usize,
+        grid: MacGrid2,
+    ) -> Result<Self> {
+        if capacity == 0 {
+            return Err(anyhow!("particle compute capacity must be > 0"));
+        }
+        let descriptor_set_layout = create_compute_descriptor_set_layout(device)?;
+        let (integrate_pipeline_layout, integrate_pipeline) =
+            create_compute_integrate_pipeline(device, descriptor_set_layout)?;
+        let (grid_pipeline_layout, grid_pipeline) =
+            create_compute_p2g_pipeline(device, descriptor_set_layout)?;
+        let buffer_size = (capacity * mem::size_of::<GpuParticle>()) as vk::DeviceSize;
+        let (buffer, buffer_memory) = create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let grid_w = grid.width() as u32;
+        let grid_h = grid.height() as u32;
+        let grid_u_count = (grid_w as usize + 1) * grid_h as usize;
+        let grid_v_count = grid_w as usize * (grid_h as usize + 1);
+        let grid_u_size = (grid_u_count * mem::size_of::<GridAccum>()) as vk::DeviceSize;
+        let grid_v_size = (grid_v_count * mem::size_of::<GridAccum>()) as vk::DeviceSize;
+        let (grid_u_buffer, grid_u_memory) = create_buffer(
+            instance,
+            device,
+            physical_device,
+            grid_u_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let (grid_v_buffer, grid_v_memory) = create_buffer(
+            instance,
+            device,
+            physical_device,
+            grid_v_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let descriptor_pool = create_compute_descriptor_pool(device)?;
+        let descriptor_set =
+            create_compute_descriptor_set(
+                device,
+                descriptor_pool,
+                descriptor_set_layout,
+                buffer,
+                grid_u_buffer,
+                grid_v_buffer,
+            )?;
+        let command_buffer = create_compute_command_buffer(device, command_pool)?;
+        let fence = create_compute_fence(device)?;
+        Ok(Self {
+            integrate_pipeline_layout,
+            integrate_pipeline,
+            grid_pipeline_layout,
+            grid_pipeline,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_set,
+            buffer,
+            buffer_memory,
+            buffer_size,
+            capacity,
+            grid_u_buffer,
+            grid_u_memory,
+            grid_u_count,
+            grid_v_buffer,
+            grid_v_memory,
+            grid_v_count,
+            grid_w,
+            grid_h,
+            command_buffer,
+            fence,
+        })
+    }
+
+    fn write_particles(&self, device: &ash::Device, data: &[GpuParticle]) -> Result<()> {
+        if data.len() > self.capacity {
+            return Err(anyhow!(
+                "gpu particle buffer too small: {} > {}",
+                data.len(),
+                self.capacity
+            ));
+        }
+        let size = (data.len() * mem::size_of::<GpuParticle>()) as vk::DeviceSize;
+        unsafe {
+            let ptr = device
+                .map_memory(self.buffer_memory, 0, size, vk::MemoryMapFlags::empty())
+                .context("map particle buffer")?;
+            ptr::copy_nonoverlapping(data.as_ptr() as *const u8, ptr as *mut u8, size as usize);
+            device.unmap_memory(self.buffer_memory);
+        }
+        Ok(())
+    }
+
+    fn read_particles(&self, device: &ash::Device, data: &mut [GpuParticle]) -> Result<()> {
+        if data.len() > self.capacity {
+            return Err(anyhow!(
+                "gpu particle buffer too small: {} > {}",
+                data.len(),
+                self.capacity
+            ));
+        }
+        let size = (data.len() * mem::size_of::<GpuParticle>()) as vk::DeviceSize;
+        unsafe {
+            let ptr = device
+                .map_memory(self.buffer_memory, 0, size, vk::MemoryMapFlags::empty())
+                .context("map particle buffer")?;
+            ptr::copy_nonoverlapping(ptr as *const u8, data.as_mut_ptr() as *mut u8, size as usize);
+            device.unmap_memory(self.buffer_memory);
+        }
+        Ok(())
+    }
+
+    fn dispatch_integrate(
+        &self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        bounds: ParticleBounds,
+        dt: f32,
+        bounce: f32,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let params = ParticleComputeParams {
+            bounds_min: [bounds.min.x, bounds.min.y],
+            bounds_max: [bounds.max.x, bounds.max.y],
+            dt,
+            bounce,
+            count: count as u32,
+            _pad: 0,
+        };
+        unsafe {
+            device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .context("wait for particle compute fence")?;
+            device
+                .reset_fences(&[self.fence])
+                .context("reset particle compute fence")?;
+            device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .context("reset particle compute command buffer")?;
+            let begin_info =
+                vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+                .context("begin particle compute command buffer")?;
+            let buffer_barrier = vk::BufferMemoryBarrier::builder()
+                .buffer(self.buffer)
+                .offset(0)
+                .size(self.buffer_size)
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_barrier.build()],
+                &[],
+            );
+            device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.integrate_pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.integrate_pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                self.command_buffer,
+                self.integrate_pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                std::slice::from_raw_parts(
+                    &params as *const ParticleComputeParams as *const u8,
+                    mem::size_of::<ParticleComputeParams>(),
+                ),
+            );
+            let groups = ((count as u32) + GPU_PARTICLE_WORKGROUP - 1) / GPU_PARTICLE_WORKGROUP;
+            device.cmd_dispatch(self.command_buffer, groups, 1, 1);
+            let buffer_barrier = vk::BufferMemoryBarrier::builder()
+                .buffer(self.buffer)
+                .offset(0)
+                .size(self.buffer_size)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_barrier.build()],
+                &[],
+            );
+            device
+                .end_command_buffer(self.command_buffer)
+                .context("end particle compute command buffer")?;
+            let command_buffers = [self.command_buffer];
+            let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
+            device
+                .queue_submit(queue, &[submit_info.build()], self.fence)
+                .context("submit particle compute command buffer")?;
+            device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .context("wait for particle compute completion")?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_p2g(
+        &self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        grid: MacGrid2,
+        scale: f32,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        if grid.width() as u32 != self.grid_w || grid.height() as u32 != self.grid_h {
+            return Err(anyhow!(
+                "gpu grid size mismatch: {}x{}",
+                grid.width(),
+                grid.height()
+            ));
+        }
+        let grid_w = grid.width() as u32;
+        let grid_h = grid.height() as u32;
+        let params = ParticleGridParams {
+            dx: grid.dx(),
+            vel_scale: scale,
+            weight_scale: scale,
+            grid_w,
+            grid_h,
+            count: count as u32,
+            _pad: 0,
+        };
+        unsafe {
+            device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .context("wait for particle p2g fence")?;
+            device
+                .reset_fences(&[self.fence])
+                .context("reset particle p2g fence")?;
+            device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .context("reset particle p2g command buffer")?;
+            let begin_info =
+                vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+                .context("begin particle p2g command buffer")?;
+            device.cmd_fill_buffer(self.command_buffer, self.grid_u_buffer, 0, self.grid_u_count as u64 * mem::size_of::<GridAccum>() as u64, 0);
+            device.cmd_fill_buffer(self.command_buffer, self.grid_v_buffer, 0, self.grid_v_count as u64 * mem::size_of::<GridAccum>() as u64, 0);
+            let transfer_barriers = [
+                vk::BufferMemoryBarrier::builder()
+                    .buffer(self.grid_u_buffer)
+                    .offset(0)
+                    .size(self.grid_u_count as u64 * mem::size_of::<GridAccum>() as u64)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .build(),
+                vk::BufferMemoryBarrier::builder()
+                    .buffer(self.grid_v_buffer)
+                    .offset(0)
+                    .size(self.grid_v_count as u64 * mem::size_of::<GridAccum>() as u64)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .build(),
+            ];
+            let particle_barrier = vk::BufferMemoryBarrier::builder()
+                .buffer(self.buffer)
+                .offset(0)
+                .size(self.buffer_size)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &transfer_barriers,
+                &[],
+            );
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[particle_barrier.build()],
+                &[],
+            );
+            device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.grid_pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.grid_pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                self.command_buffer,
+                self.grid_pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                std::slice::from_raw_parts(
+                    &params as *const ParticleGridParams as *const u8,
+                    mem::size_of::<ParticleGridParams>(),
+                ),
+            );
+            let groups = ((count as u32) + GPU_PARTICLE_WORKGROUP - 1) / GPU_PARTICLE_WORKGROUP;
+            device.cmd_dispatch(self.command_buffer, groups, 1, 1);
+            let read_barriers = [
+                vk::BufferMemoryBarrier::builder()
+                    .buffer(self.grid_u_buffer)
+                    .offset(0)
+                    .size(self.grid_u_count as u64 * mem::size_of::<GridAccum>() as u64)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .build(),
+                vk::BufferMemoryBarrier::builder()
+                    .buffer(self.grid_v_buffer)
+                    .offset(0)
+                    .size(self.grid_v_count as u64 * mem::size_of::<GridAccum>() as u64)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .build(),
+            ];
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &read_barriers,
+                &[],
+            );
+            device
+                .end_command_buffer(self.command_buffer)
+                .context("end particle p2g command buffer")?;
+            let command_buffers = [self.command_buffer];
+            let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
+            device
+                .queue_submit(queue, &[submit_info.build()], self.fence)
+                .context("submit particle p2g command buffer")?;
+            device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .context("wait for particle p2g completion")?;
+        }
+        Ok(())
+    }
+
+    fn read_grid(&self, device: &ash::Device) -> Result<(Vec<GridAccum>, Vec<GridAccum>)> {
+        let u_len = self.grid_u_count;
+        let v_len = self.grid_v_count;
+        let mut u_accum = vec![GridAccum::default(); u_len];
+        let mut v_accum = vec![GridAccum::default(); v_len];
+        let u_size = (u_len * mem::size_of::<GridAccum>()) as vk::DeviceSize;
+        let v_size = (v_len * mem::size_of::<GridAccum>()) as vk::DeviceSize;
+        unsafe {
+            let ptr = device
+                .map_memory(self.grid_u_memory, 0, u_size, vk::MemoryMapFlags::empty())
+                .context("map grid u buffer")?;
+            ptr::copy_nonoverlapping(ptr as *const u8, u_accum.as_mut_ptr() as *mut u8, u_size as usize);
+            device.unmap_memory(self.grid_u_memory);
+            let ptr = device
+                .map_memory(self.grid_v_memory, 0, v_size, vk::MemoryMapFlags::empty())
+                .context("map grid v buffer")?;
+            ptr::copy_nonoverlapping(ptr as *const u8, v_accum.as_mut_ptr() as *mut u8, v_size as usize);
+            device.unmap_memory(self.grid_v_memory);
+        }
+        Ok((u_accum, v_accum))
+    }
+
+    fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_fence(self.fence, None);
+            device.destroy_pipeline(self.integrate_pipeline, None);
+            device.destroy_pipeline_layout(self.integrate_pipeline_layout, None);
+            device.destroy_pipeline(self.grid_pipeline, None);
+            device.destroy_pipeline_layout(self.grid_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.buffer_memory, None);
+            device.destroy_buffer(self.grid_u_buffer, None);
+            device.free_memory(self.grid_u_memory, None);
+            device.destroy_buffer(self.grid_v_buffer, None);
+            device.free_memory(self.grid_v_memory, None);
+        }
+    }
+}
+
+fn accum_to_velocity(
+    grid: MacGrid2,
+    u_accum: &[GridAccum],
+    v_accum: &[GridAccum],
+    scale: f32,
+) -> Result<MacVelocity2> {
+    if scale <= 0.0 || !scale.is_finite() {
+        return Err(anyhow!("invalid gpu p2g scale: {scale}"));
+    }
+    let u_grid = grid.u_grid();
+    let v_grid = grid.v_grid();
+    if u_accum.len() != u_grid.size() || v_accum.len() != v_grid.size() {
+        return Err(anyhow!(
+            "gpu grid size mismatch: u {} v {}",
+            u_accum.len(),
+            v_accum.len()
+        ));
+    }
+    let u_data = accum_to_data(u_accum, scale);
+    let v_data = accum_to_data(v_accum, scale);
+    let u = StaggeredField2::from_data(u_grid, u_data);
+    let v = StaggeredField2::from_data(v_grid, v_data);
+    Ok(MacVelocity2::from_components(grid, u, v))
+}
+
+fn accum_to_data(accum: &[GridAccum], scale: f32) -> Vec<f32> {
+    accum
+        .iter()
+        .map(|entry| {
+            if entry.weight <= 0 {
+                return 0.0;
+            }
+            let weight = entry.weight as f32 / scale;
+            if weight <= 0.0 {
+                return 0.0;
+            }
+            (entry.sum as f32 / scale) / weight
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(a: f32, b: f32, tol: f32) {
+        assert!(
+            (a - b).abs() <= tol,
+            "expected {a} to be within {tol} of {b}"
+        );
+    }
+
+    #[test]
+    fn accum_to_data_divides_by_weight() {
+        let accum = vec![GridAccum { sum: 200, weight: 100 }];
+        let data = accum_to_data(&accum, 100.0);
+        assert_close(data[0], 2.0, 1e-6);
+    }
+
+    #[test]
+    fn accum_to_velocity_builds_mac() {
+        let grid = MacGrid2::new(1, 1, 1.0);
+        let u_accum = vec![
+            GridAccum { sum: 100, weight: 50 },
+            GridAccum { sum: 0, weight: 0 },
+        ];
+        let v_accum = vec![
+            GridAccum { sum: 200, weight: 100 },
+            GridAccum { sum: 0, weight: 0 },
+        ];
+        let vel = accum_to_velocity(grid, &u_accum, &v_accum, 100.0).unwrap();
+        assert_close(vel.u().get(0, 0), 2.0, 1e-6);
+        assert_close(vel.v().get(0, 0), 2.0, 1e-6);
+    }
+}
+
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(state) = self.particle_compute.take() {
+                state.destroy(&self.device);
+            }
             self.device.destroy_fence(self.in_flight_fence, None);
             self.device
                 .destroy_semaphore(self.render_finished, None);
@@ -714,6 +1352,353 @@ void main() {
         device.destroy_shader_module(frag_module, None);
     }
     Ok(pipeline)
+}
+
+fn create_compute_descriptor_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::builder()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .build(),
+        vk::DescriptorSetLayoutBinding::builder()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .build(),
+        vk::DescriptorSetLayoutBinding::builder()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .build(),
+    ];
+    let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
+    unsafe {
+        device
+            .create_descriptor_set_layout(&info, None)
+            .context("create compute descriptor set layout")
+    }
+}
+
+fn create_compute_integrate_pipeline(
+    device: &ash::Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+    const COMPUTE_SRC: &str = r#"
+#version 450
+layout(local_size_x = 256) in;
+struct Particle {
+    vec2 pos;
+    vec2 vel;
+};
+layout(set = 0, binding = 0) buffer Particles {
+    Particle particles[];
+};
+layout(push_constant) uniform Params {
+    vec2 bounds_min;
+    vec2 bounds_max;
+    float dt;
+    float bounce;
+    uint count;
+    uint pad0;
+} params;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.count) {
+        return;
+    }
+    Particle p = particles[idx];
+    p.pos += p.vel * params.dt;
+    if (p.pos.x < params.bounds_min.x) {
+        p.pos.x = params.bounds_min.x;
+        if (p.vel.x < 0.0) {
+            p.vel.x = -p.vel.x * params.bounce;
+        }
+    } else if (p.pos.x > params.bounds_max.x) {
+        p.pos.x = params.bounds_max.x;
+        if (p.vel.x > 0.0) {
+            p.vel.x = -p.vel.x * params.bounce;
+        }
+    }
+    if (p.pos.y < params.bounds_min.y) {
+        p.pos.y = params.bounds_min.y;
+        if (p.vel.y < 0.0) {
+            p.vel.y = -p.vel.y * params.bounce;
+        }
+    } else if (p.pos.y > params.bounds_max.y) {
+        p.pos.y = params.bounds_max.y;
+        if (p.vel.y > 0.0) {
+            p.vel.y = -p.vel.y * params.bounce;
+        }
+    }
+    particles[idx] = p;
+}
+"#;
+    let comp_spv = compile_shader(COMPUTE_SRC, ShaderKind::Compute, "particles.comp")?;
+    let comp_module = create_shader_module(device, &comp_spv)?;
+    let entry = CString::new("main")?;
+    let stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(comp_module)
+        .name(&entry);
+    let push_range = vk::PushConstantRange::builder()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .offset(0)
+        .size(mem::size_of::<ParticleComputeParams>() as u32);
+    let layouts = [descriptor_set_layout];
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+        .set_layouts(&layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_range));
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .context("create compute pipeline layout")?
+    };
+    let pipeline_info = vk::ComputePipelineCreateInfo::builder()
+        .stage(stage.build())
+        .layout(pipeline_layout);
+    let pipeline = unsafe {
+        device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info.build()], None)
+            .map_err(|err| anyhow!("create compute pipeline: {err:?}"))?[0]
+    };
+    unsafe {
+        device.destroy_shader_module(comp_module, None);
+    }
+    Ok((pipeline_layout, pipeline))
+}
+
+fn create_compute_p2g_pipeline(
+    device: &ash::Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+    const COMPUTE_SRC: &str = r#"
+#version 450
+layout(local_size_x = 256) in;
+struct Particle {
+    vec2 pos;
+    vec2 vel;
+};
+layout(set = 0, binding = 0) readonly buffer Particles {
+    Particle particles[];
+};
+layout(set = 0, binding = 1) buffer UGrid {
+    ivec2 u_accum[];
+};
+layout(set = 0, binding = 2) buffer VGrid {
+    ivec2 v_accum[];
+};
+layout(push_constant) uniform Params {
+    float dx;
+    float vel_scale;
+    float weight_scale;
+    uint grid_w;
+    uint grid_h;
+    uint count;
+    uint pad0;
+} params;
+
+void add_u(int ix, int iy, float w, float vel) {
+    if (ix < 0 || iy < 0 || ix > int(params.grid_w) || iy >= int(params.grid_h)) {
+        return;
+    }
+    int w_i = int(w * params.weight_scale + 0.5);
+    if (w_i == 0) {
+        return;
+    }
+    int v_i = int(vel * w * params.vel_scale);
+    uint idx = uint(iy) * (params.grid_w + 1u) + uint(ix);
+    atomicAdd(u_accum[idx].x, v_i);
+    atomicAdd(u_accum[idx].y, w_i);
+}
+
+void add_v(int ix, int iy, float w, float vel) {
+    if (ix < 0 || iy < 0 || ix >= int(params.grid_w) || iy > int(params.grid_h)) {
+        return;
+    }
+    int w_i = int(w * params.weight_scale + 0.5);
+    if (w_i == 0) {
+        return;
+    }
+    int v_i = int(vel * w * params.vel_scale);
+    uint idx = uint(iy) * params.grid_w + uint(ix);
+    atomicAdd(v_accum[idx].x, v_i);
+    atomicAdd(v_accum[idx].y, w_i);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.count) {
+        return;
+    }
+    Particle p = particles[idx];
+    float gx = p.pos.x / params.dx;
+    float gy = p.pos.y / params.dx - 0.5;
+    int ix0 = int(floor(gx));
+    int iy0 = int(floor(gy));
+    float fx = gx - float(ix0);
+    float fy = gy - float(iy0);
+    for (int dy = 0; dy <= 1; dy++) {
+        float wy = (dy == 0) ? (1.0 - fy) : fy;
+        int iy = iy0 + dy;
+        for (int dx = 0; dx <= 1; dx++) {
+            float wx = (dx == 0) ? (1.0 - fx) : fx;
+            int ix = ix0 + dx;
+            float w = wx * wy;
+            add_u(ix, iy, w, p.vel.x);
+        }
+    }
+
+    gx = p.pos.x / params.dx - 0.5;
+    gy = p.pos.y / params.dx;
+    ix0 = int(floor(gx));
+    iy0 = int(floor(gy));
+    fx = gx - float(ix0);
+    fy = gy - float(iy0);
+    for (int dy = 0; dy <= 1; dy++) {
+        float wy = (dy == 0) ? (1.0 - fy) : fy;
+        int iy = iy0 + dy;
+        for (int dx = 0; dx <= 1; dx++) {
+            float wx = (dx == 0) ? (1.0 - fx) : fx;
+            int ix = ix0 + dx;
+            float w = wx * wy;
+            add_v(ix, iy, w, p.vel.y);
+        }
+    }
+}
+"#;
+    let comp_spv = compile_shader(COMPUTE_SRC, ShaderKind::Compute, "particles_p2g.comp")?;
+    let comp_module = create_shader_module(device, &comp_spv)?;
+    let entry = CString::new("main")?;
+    let stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(comp_module)
+        .name(&entry);
+    let push_range = vk::PushConstantRange::builder()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .offset(0)
+        .size(mem::size_of::<ParticleGridParams>() as u32);
+    let layouts = [descriptor_set_layout];
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+        .set_layouts(&layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_range));
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .context("create p2g pipeline layout")?
+    };
+    let pipeline_info = vk::ComputePipelineCreateInfo::builder()
+        .stage(stage.build())
+        .layout(pipeline_layout);
+    let pipeline = unsafe {
+        device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info.build()], None)
+            .map_err(|err| anyhow!("create p2g pipeline: {err:?}"))?[0]
+    };
+    unsafe {
+        device.destroy_shader_module(comp_module, None);
+    }
+    Ok((pipeline_layout, pipeline))
+}
+
+fn create_compute_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool> {
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 3,
+    }];
+    let pool_info = vk::DescriptorPoolCreateInfo::builder()
+        .pool_sizes(&pool_sizes)
+        .max_sets(1);
+    unsafe {
+        device
+            .create_descriptor_pool(&pool_info, None)
+            .context("create compute descriptor pool")
+    }
+}
+
+fn create_compute_descriptor_set(
+    device: &ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    buffer: vk::Buffer,
+    grid_u: vk::Buffer,
+    grid_v: vk::Buffer,
+) -> Result<vk::DescriptorSet> {
+    let layouts = [descriptor_set_layout];
+    let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+    let descriptor_set = unsafe {
+        device
+            .allocate_descriptor_sets(&alloc_info)
+            .context("allocate compute descriptor set")?[0]
+    };
+    let particle_info = vk::DescriptorBufferInfo::builder()
+        .buffer(buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+    let u_info = vk::DescriptorBufferInfo::builder()
+        .buffer(grid_u)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+    let v_info = vk::DescriptorBufferInfo::builder()
+        .buffer(grid_v)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+    let writes = [
+        vk::WriteDescriptorSet::builder()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&particle_info))
+            .build(),
+        vk::WriteDescriptorSet::builder()
+            .dst_set(descriptor_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&u_info))
+            .build(),
+        vk::WriteDescriptorSet::builder()
+            .dst_set(descriptor_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&v_info))
+            .build(),
+    ];
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
+    }
+    Ok(descriptor_set)
+}
+
+fn create_compute_command_buffer(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+) -> Result<vk::CommandBuffer> {
+    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let command_buffer = unsafe {
+        device
+            .allocate_command_buffers(&alloc_info)
+            .context("allocate compute command buffer")?[0]
+    };
+    Ok(command_buffer)
+}
+
+fn create_compute_fence(device: &ash::Device) -> Result<vk::Fence> {
+    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+    unsafe {
+        device
+            .create_fence(&fence_info, None)
+            .context("create compute fence")
+    }
 }
 
 fn compile_shader(source: &str, kind: ShaderKind, name: &str) -> Result<Vec<u32>> {

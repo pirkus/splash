@@ -385,7 +385,7 @@ fn reinit_step_into(out: &mut Field2, phi: &Field2, phi0: &Field2, dt: f32) {
     });
 }
 
-fn correct_phi_volume(phi: &Field2, target_volume: f32, band: f32) -> Field2 {
+pub fn correct_phi_volume(phi: &Field2, target_volume: f32, band: f32) -> Field2 {
     if target_volume <= 0.0 || !target_volume.is_finite() {
         return phi.clone();
     }

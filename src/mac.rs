@@ -478,6 +478,7 @@ impl MacVelocity2 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BoundaryCondition {
     NoSlip,
+    Slip,
     Inflow(Vec2),
     Outflow,
 }
@@ -511,6 +512,7 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if x == 0 {
             return match config.left {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => u_field.get(1, y),
             };
@@ -518,6 +520,7 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if x == w {
             return match config.right {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => u_field.get(w - 1, y),
             };
@@ -525,12 +528,19 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if y == 0 {
             return match config.bottom {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if h > 1 {
+                        u_field.get(x, 1)
+                    } else {
+                        u_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => {
                     if h > 1 {
                         u_field.get(x, 1)
                     } else {
-                        value
+                        u_field.get(x, y)
                     }
                 }
             };
@@ -538,12 +548,19 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if y + 1 == h {
             return match config.top {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if h > 1 {
+                        u_field.get(x, h - 2)
+                    } else {
+                        u_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => {
                     if h > 1 {
                         u_field.get(x, h - 2)
                     } else {
-                        value
+                        u_field.get(x, y)
                     }
                 }
             };
@@ -554,6 +571,7 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if y == 0 {
             return match config.bottom {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => v_field.get(x, 1),
             };
@@ -561,6 +579,7 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if y == h {
             return match config.top {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => v_field.get(x, h - 1),
             };
@@ -568,12 +587,19 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if x == 0 {
             return match config.left {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if w > 1 {
+                        v_field.get(1, y)
+                    } else {
+                        v_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => {
                     if w > 1 {
                         v_field.get(1, y)
                     } else {
-                        value
+                        v_field.get(x, y)
                     }
                 }
             };
@@ -581,12 +607,19 @@ pub fn apply_domain_boundaries(velocity: &MacVelocity2, config: BoundaryConfig) 
         if x + 1 == w {
             return match config.right {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if w > 1 {
+                        v_field.get(w - 2, y)
+                    } else {
+                        v_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => {
                     if w > 1 {
                         v_field.get(w - 2, y)
                     } else {
-                        value
+                        v_field.get(x, y)
                     }
                 }
             };
@@ -611,6 +644,7 @@ pub fn apply_domain_boundaries_into(
         if x == 0 {
             return match config.left {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => u_field.get(1, y),
             };
@@ -618,6 +652,7 @@ pub fn apply_domain_boundaries_into(
         if x == w {
             return match config.right {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => u_field.get(w - 1, y),
             };
@@ -625,6 +660,13 @@ pub fn apply_domain_boundaries_into(
         if y == 0 {
             return match config.bottom {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if h > 1 {
+                        u_field.get(x, 1)
+                    } else {
+                        u_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => {
                     if h > 1 {
@@ -638,6 +680,13 @@ pub fn apply_domain_boundaries_into(
         if y + 1 == h {
             return match config.top {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if h > 1 {
+                        u_field.get(x, h - 2)
+                    } else {
+                        u_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.x,
                 BoundaryCondition::Outflow => {
                     if h > 1 {
@@ -654,6 +703,7 @@ pub fn apply_domain_boundaries_into(
         if y == 0 {
             return match config.bottom {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => v_field.get(x, 1),
             };
@@ -661,6 +711,7 @@ pub fn apply_domain_boundaries_into(
         if y == h {
             return match config.top {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => 0.0,
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => v_field.get(x, h - 1),
             };
@@ -668,6 +719,13 @@ pub fn apply_domain_boundaries_into(
         if x == 0 {
             return match config.left {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if w > 1 {
+                        v_field.get(1, y)
+                    } else {
+                        v_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => {
                     if w > 1 {
@@ -681,6 +739,13 @@ pub fn apply_domain_boundaries_into(
         if x + 1 == w {
             return match config.right {
                 BoundaryCondition::NoSlip => 0.0,
+                BoundaryCondition::Slip => {
+                    if w > 1 {
+                        v_field.get(w - 2, y)
+                    } else {
+                        v_field.get(x, y)
+                    }
+                }
                 BoundaryCondition::Inflow(v) => v.y,
                 BoundaryCondition::Outflow => {
                     if w > 1 {

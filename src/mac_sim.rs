@@ -1811,7 +1811,7 @@ pub fn apply_fluid_mask_into(velocity: &mut MacVelocity2, source: &MacVelocity2,
     });
 }
 
-pub(crate) fn extrapolate_velocity(
+pub fn extrapolate_velocity(
     velocity: &MacVelocity2,
     flags: &CellFlags,
     iterations: usize,

@@ -1,0 +1,25 @@
+init drop_speed=-20.00
+dye params diffusion=0.000000 decay=1.000000 air_decay=1.000000 base=0.450 reinject=0.000
+headless mode frames=200
+init mode=4 sum=28636.49->28634.13 min=0.000->0.000 max=1.000->1.000 nonfinite=0 -> 0
+frame 10 mode=4 sim_ms=156.56 frame_ms=156.56 fps=6.4 mass=59870.00 div=3460.28 vel_max=26.17 drop_vy=-21.37 drop_vmax=23.89 drop_n=1900 drop_center=(127.95,159.32) vol_raw=28822.11 vol_render=28630.64
+frame 20 mode=4 sim_ms=142.83 frame_ms=142.83 fps=7.0 mass=59870.00 div=3579.83 vel_max=27.62 drop_vy=-23.41 drop_vmax=26.99 drop_n=1900 drop_center=(127.96,151.03) vol_raw=28956.50 vol_render=28634.05
+frame 30 mode=4 sim_ms=136.69 frame_ms=136.69 fps=7.3 mass=59870.00 div=3265.39 vel_max=38.73 drop_vy=-24.08 drop_vmax=29.83 drop_n=1867 drop_center=(127.91,143.04) vol_raw=28997.61 vol_render=28644.01
+frame 40 mode=4 sim_ms=139.91 frame_ms=139.91 fps=7.1 mass=59870.00 div=2720.78 vel_max=37.78 drop_vy=-17.80 drop_vmax=25.57 drop_n=1733 drop_center=(127.94,139.66) vol_raw=29103.67 vol_render=28624.99
+frame 50 mode=4 sim_ms=143.56 frame_ms=143.56 fps=7.0 mass=59870.00 div=3227.28 vel_max=34.85 drop_vy=-13.33 drop_vmax=26.18 drop_n=1608 drop_center=(127.74,136.65) vol_raw=29125.14 vol_render=28630.31
+frame 60 mode=4 sim_ms=138.46 frame_ms=138.46 fps=7.2 mass=59870.00 div=3518.84 vel_max=33.64 drop_vy=-8.51 drop_vmax=25.24 drop_n=1460 drop_center=(127.73,134.51) vol_raw=29103.83 vol_render=28639.20
+frame 70 mode=4 sim_ms=129.88 frame_ms=129.88 fps=7.7 mass=59870.00 div=3600.78 vel_max=31.36 drop_vy=-3.09 drop_vmax=25.95 drop_n=1317 drop_center=(127.24,133.48) vol_raw=29120.79 vol_render=28627.12
+frame 80 mode=4 sim_ms=132.89 frame_ms=132.89 fps=7.5 mass=59870.00 div=3820.33 vel_max=30.53 drop_vy=1.90 drop_vmax=20.76 drop_n=1190 drop_center=(126.78,133.90) vol_raw=29105.49 vol_render=28638.31
+frame 90 mode=4 sim_ms=139.39 frame_ms=139.39 fps=7.2 mass=59870.00 div=3802.09 vel_max=27.84 drop_vy=4.60 drop_vmax=20.24 drop_n=1163 drop_center=(127.14,135.23) vol_raw=29114.42 vol_render=28633.81
+frame 100 mode=4 sim_ms=134.93 frame_ms=134.93 fps=7.4 mass=59870.00 div=3644.66 vel_max=27.30 drop_vy=2.71 drop_vmax=10.55 drop_n=1378 drop_center=(127.82,135.35) vol_raw=29093.91 vol_render=28634.96
+frame 110 mode=4 sim_ms=139.38 frame_ms=139.38 fps=7.2 mass=59870.00 div=3623.28 vel_max=25.04 drop_vy=0.69 drop_vmax=7.54 drop_n=1610 drop_center=(127.93,134.86) vol_raw=29102.58 vol_render=28636.56
+frame 120 mode=4 sim_ms=133.47 frame_ms=133.47 fps=7.5 mass=59870.00 div=3748.17 vel_max=24.65 drop_vy=-0.87 drop_vmax=8.40 drop_n=1783 drop_center=(127.58,134.12) vol_raw=29106.31 vol_render=28628.57
+frame 130 mode=4 sim_ms=140.54 frame_ms=140.55 fps=7.1 mass=59870.00 div=3686.49 vel_max=27.07 drop_vy=-1.77 drop_vmax=11.78 drop_n=1880 drop_center=(127.37,133.27) vol_raw=29037.28 vol_render=28635.52
+frame 140 mode=4 sim_ms=130.75 frame_ms=130.75 fps=7.6 mass=59870.00 div=3373.90 vel_max=26.62 drop_vy=-2.24 drop_vmax=11.74 drop_n=1897 drop_center=(126.91,132.45) vol_raw=29022.32 vol_render=28627.73
+frame 150 mode=4 sim_ms=144.19 frame_ms=144.19 fps=6.9 mass=59870.00 div=3271.70 vel_max=25.01 drop_vy=-1.92 drop_vmax=14.52 drop_n=1825 drop_center=(126.37,131.84) vol_raw=29035.57 vol_render=28648.79
+frame 160 mode=4 sim_ms=139.18 frame_ms=139.18 fps=7.2 mass=59870.00 div=3111.66 vel_max=25.05 drop_vy=-1.70 drop_vmax=10.61 drop_n=1670 drop_center=(126.41,131.47) vol_raw=28976.06 vol_render=28638.78
+frame 170 mode=4 sim_ms=136.39 frame_ms=136.39 fps=7.3 mass=59870.00 div=3072.93 vel_max=30.75 drop_vy=-0.95 drop_vmax=29.62 drop_n=1481 drop_center=(126.71,131.38) vol_raw=28955.72 vol_render=28625.75
+frame 180 mode=4 sim_ms=143.41 frame_ms=143.41 fps=7.0 mass=59870.00 div=2787.44 vel_max=26.56 drop_vy=0.02 drop_vmax=26.56 drop_n=1296 drop_center=(127.14,131.71) vol_raw=28892.05 vol_render=28631.93
+frame 190 mode=4 sim_ms=133.98 frame_ms=133.98 fps=7.5 mass=59870.00 div=2920.20 vel_max=28.65 drop_vy=1.03 drop_vmax=28.59 drop_n=1106 drop_center=(128.19,132.57) vol_raw=28871.08 vol_render=28645.85
+frame 200 mode=4 sim_ms=127.20 frame_ms=127.20 fps=7.9 mass=59870.00 div=3130.35 vel_max=24.16 drop_vy=1.44 drop_vmax=24.14 drop_n=958 drop_center=(130.94,133.84) vol_raw=28799.98 vol_render=28636.64
+validation case=drop frames=200 vol_raw_min=28412.11 vol_loss_pct=0.78 max_div=3869.64 specks_avg=927.30 specks_max=1146

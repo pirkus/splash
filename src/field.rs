@@ -587,4 +587,5 @@ mod tests {
             .sum();
         assert_close(dot, manual, 1e-6);
     }
+
 }

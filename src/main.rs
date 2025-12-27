@@ -1,12 +1,16 @@
 use anyhow::Result;
 use nav_stokes_sim::{
-    advect_level_set_surface_in_place, apply_domain_boundaries, flags_from_density, flags_from_phi,
-    level_set_step_in_place, overlay_text, phi_to_density, divergence, project_with_flags,
-    step_in_place, step_in_place_mg, volume_from_phi, AdvectionScheme, BoundaryConfig, CellFlags,
-    CellType, Field2, LevelSetParams, LevelSetState, LevelSetWorkspace, MacGrid2, MacSimMgWorkspace,
+    advect_level_set_surface_in_place, apply_domain_boundaries, apply_solid_boundaries,
+    flags_from_density, flags_from_phi,
+    correct_phi_volume, level_set_step_in_place, overlay_text, phi_to_density, reinitialize_phi,
+    divergence, extrapolate_velocity, project_with_flags, step_in_place, step_in_place_mg,
+    volume_from_phi, AdvectionScheme, BoundaryCondition, BoundaryConfig, CellFlags, CellType,
+    Field2, LevelSetParams, LevelSetState, LevelSetWorkspace, MacGrid2, MacSimMgWorkspace,
     MacSimParams, MacSimState, MacSimWorkspace, MacVelocity2, MultigridParams, ParticleBounds,
     ParticlePhase, ParticleSystem, StaggeredField2, Vec2, VulkanApp, GLYPH_HEIGHT, LINE_SPACING,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Instant;
 use winit::{
@@ -21,6 +25,7 @@ enum SimMode {
     LevelSet,
     DensityMg,
     Particles,
+    ParticlesGpu,
 }
 
 impl SimMode {
@@ -29,7 +34,8 @@ impl SimMode {
             SimMode::Density => SimMode::LevelSet,
             SimMode::LevelSet => SimMode::DensityMg,
             SimMode::DensityMg => SimMode::Particles,
-            SimMode::Particles => SimMode::Density,
+            SimMode::Particles => SimMode::ParticlesGpu,
+            SimMode::ParticlesGpu => SimMode::Density,
         }
     }
 
@@ -39,6 +45,7 @@ impl SimMode {
             SimMode::LevelSet => '2',
             SimMode::DensityMg => '3',
             SimMode::Particles => '4',
+            SimMode::ParticlesGpu => '5',
         }
     }
 }
@@ -51,6 +58,13 @@ struct InitConfig {
     drop_speed: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Obstacle {
+    center: Vec2,
+    radius: f32,
+    bounce: f32,
+}
+
 impl InitConfig {
     fn new(grid: MacGrid2) -> Self {
         let size = grid.width().min(grid.height()) as f32;
@@ -60,7 +74,7 @@ impl InitConfig {
             grid.width() as f32 * 0.5,
             base_height + drop_radius * 1.9,
         );
-        let drop_speed = env_f32("SIM_DROP_SPEED").unwrap_or(-10.0);
+        let drop_speed = env_f32("SIM_DROP_SPEED").unwrap_or(-20.0);
         Self {
             base_height,
             drop_radius,
@@ -182,12 +196,17 @@ fn env_usize(key: &str) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
+fn env_string(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
 fn start_mode() -> SimMode {
     match std::env::var("SIM_START_MODE").ok().as_deref() {
         Some("1") => SimMode::Density,
         Some("2") => SimMode::LevelSet,
         Some("3") => SimMode::DensityMg,
         Some("4") => SimMode::Particles,
+        Some("5") => SimMode::ParticlesGpu,
         _ => SimMode::DensityMg,
     }
 }
@@ -202,6 +221,42 @@ fn headless_enabled() -> bool {
         return true;
     }
     std::env::args().any(|arg| arg == "--headless")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ValidationCase {
+    Drop,
+    DamBreak,
+    Volume,
+    Slosh,
+    Obstacle,
+}
+
+impl ValidationCase {
+    fn label(self) -> &'static str {
+        match self {
+            ValidationCase::Drop => "drop",
+            ValidationCase::DamBreak => "dam_break",
+            ValidationCase::Volume => "volume",
+            ValidationCase::Slosh => "slosh",
+            ValidationCase::Obstacle => "obstacle",
+        }
+    }
+}
+
+fn validation_case() -> Option<ValidationCase> {
+    match std::env::var("SIM_VALIDATE_CASE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("drop") => Some(ValidationCase::Drop),
+        Some("dam") | Some("dam_break") | Some("dambreak") => Some(ValidationCase::DamBreak),
+        Some("volume") | Some("conservation") => Some(ValidationCase::Volume),
+        Some("slosh") | Some("sloshing") => Some(ValidationCase::Slosh),
+        Some("obstacle") | Some("wake") => Some(ValidationCase::Obstacle),
+        _ => None,
+    }
 }
 
 fn headless_frames() -> u64 {
@@ -274,6 +329,153 @@ fn dump_matrix(label: &str, frame: u64, field: &Field2, stride: usize) {
         }
         println!("{}", line.trim_end());
     }
+}
+
+#[derive(Clone, Debug)]
+struct ValidationMetrics {
+    case: ValidationCase,
+    frames: u64,
+    max_div: f32,
+    min_vol_raw: f32,
+    max_vol_raw: f32,
+    specks_sum: usize,
+    specks_max: usize,
+    samples: usize,
+}
+
+impl ValidationMetrics {
+    fn new(case: ValidationCase) -> Self {
+        Self {
+            case,
+            frames: 0,
+            max_div: 0.0,
+            min_vol_raw: f32::INFINITY,
+            max_vol_raw: 0.0,
+            specks_sum: 0,
+            specks_max: 0,
+            samples: 0,
+        }
+    }
+}
+
+fn count_surface_specks(field: &Field2, threshold: f32, start_y: usize) -> usize {
+    let grid = field.grid();
+    let width = grid.width();
+    let height = grid.height();
+    let start_y = start_y.min(height);
+    let mut count = 0usize;
+    for y in start_y..height {
+        for x in 0..width {
+            if field.get(x, y) > threshold {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn apply_surface_hysteresis(
+    field: &mut Field2,
+    strong: f32,
+    weak: f32,
+    min_neighbors: usize,
+) {
+    if strong <= 0.0 || weak <= 0.0 {
+        return;
+    }
+    let strong = strong.clamp(0.0, 1.0).max(weak);
+    let weak = weak.clamp(0.0, strong);
+    let grid = field.grid();
+    let width = grid.width();
+    let height = grid.height();
+    let size = width * height;
+    let mut strong_mask = vec![false; size];
+    let mut weak_mask = vec![false; size];
+    for y in 0..height {
+        for x in 0..width {
+            let v = field.get(x, y);
+            let idx = y * width + x;
+            if v >= strong {
+                strong_mask[idx] = true;
+                weak_mask[idx] = true;
+            } else if v >= weak {
+                weak_mask[idx] = true;
+            }
+        }
+    }
+    let mut keep = vec![false; size];
+    for i in 0..size {
+        if strong_mask[i] {
+            keep[i] = true;
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            if keep[idx] || !weak_mask[idx] {
+                continue;
+            }
+            let mut has_strong = false;
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(height - 1);
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(width - 1);
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    let nidx = ny * width + nx;
+                    if strong_mask[nidx] {
+                        has_strong = true;
+                        break;
+                    }
+                }
+                if has_strong {
+                    break;
+                }
+            }
+            if has_strong {
+                keep[idx] = true;
+            }
+        }
+    }
+    if min_neighbors > 0 {
+        let mut filtered = keep.clone();
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                if !keep[idx] {
+                    continue;
+                }
+                let mut neighbors = 0usize;
+                let y0 = y.saturating_sub(1);
+                let y1 = (y + 1).min(height - 1);
+                let x0 = x.saturating_sub(1);
+                let x1 = (x + 1).min(width - 1);
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        if nx == x && ny == y {
+                            continue;
+                        }
+                        if keep[ny * width + nx] {
+                            neighbors += 1;
+                        }
+                    }
+                }
+                if neighbors < min_neighbors {
+                    filtered[idx] = false;
+                }
+            }
+        }
+        keep = filtered;
+    }
+    let original = field.clone();
+    field.fill_with_index(|x, y| {
+        let idx = y * width + x;
+        if keep[idx] {
+            original.get(x, y)
+        } else {
+            0.0
+        }
+    });
 }
 
 fn advect_dye_into(out: &mut Field2, dye: &Field2, velocity: &MacVelocity2, dt: f32) {
@@ -483,6 +685,50 @@ fn droplet_vy_stats(
     }
 }
 
+fn particle_droplet_center(
+    particles: &ParticleSystem,
+    base_height: f32,
+) -> Option<(f32, f32)> {
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut count = 0usize;
+    for pos in particles.positions() {
+        if pos.y <= base_height {
+            continue;
+        }
+        sum_x += pos.x;
+        sum_y += pos.y;
+        count += 1;
+    }
+    if count > 0 {
+        Some((sum_x / count as f32, sum_y / count as f32))
+    } else {
+        None
+    }
+}
+
+fn particle_droplet_vy_stats(
+    particles: &ParticleSystem,
+    base_height: f32,
+) -> Option<(f32, f32, usize)> {
+    let mut sum_vy = 0.0;
+    let mut max_v: f32 = 0.0;
+    let mut count = 0usize;
+    for (pos, vel) in particles.positions().iter().zip(particles.velocities()) {
+        if pos.y <= base_height {
+            continue;
+        }
+        sum_vy += vel.y;
+        max_v = max_v.max(vel.y.abs());
+        count += 1;
+    }
+    if count > 0 {
+        Some((sum_vy / count as f32, max_v, count))
+    } else {
+        None
+    }
+}
+
 fn density_to_luma(density: &Field2, out: &mut Vec<u8>) {
     let grid = density.grid();
     let width = grid.width();
@@ -545,6 +791,42 @@ fn display_phi(phi: &Field2, band: f32) -> Field2 {
     phi_to_density(phi, band)
 }
 
+fn particle_level_set_from_particles(
+    particles: &ParticleSystem,
+    grid: MacGrid2,
+    bounds: ParticleBounds,
+    particle_radius: f32,
+    max_distance: f32,
+    reinit_iters: usize,
+    reinit_dt: f32,
+    volume_blend: f32,
+    volume_weight_band: f32,
+    target_volume: Option<(f32, f32)>,
+) -> Field2 {
+    let mut phi = particles.to_level_set(grid, bounds, particle_radius, max_distance);
+    if reinit_iters > 0 && reinit_dt > 0.0 {
+        phi = reinitialize_phi(&phi, reinit_iters, reinit_dt);
+    }
+    let volume_blend = volume_blend.clamp(0.0, 1.0);
+    if let Some((volume, band)) = target_volume {
+        if volume_blend >= 1.0 {
+            phi = correct_phi_volume(&phi, volume, band);
+        } else if volume_blend > 0.0 {
+            let corrected = correct_phi_volume(&phi, volume, band);
+            let weight_band = if volume_weight_band > 0.0 {
+                volume_weight_band
+            } else {
+                band.max(1e-6)
+            };
+            phi = phi.zip_with(&corrected, |a, b| {
+                let w = ((weight_band - a.abs()) / weight_band).clamp(0.0, 1.0);
+                a + (b - a) * volume_blend * w
+            });
+        }
+    }
+    phi
+}
+
 fn effective_dt(dt: f32, cfl: f32, velocity: &MacVelocity2) -> f32 {
     if dt <= 0.0 || cfl <= 0.0 {
         return dt;
@@ -568,6 +850,7 @@ fn overlay_hud(
     iters: usize,
     fps: f32,
     sim_ms: f32,
+    extra_lines: &[String],
 ) {
     let line_height = GLYPH_HEIGHT + LINE_SPACING;
     let line_1 = format!("{} DT {:.3}", mode.tag(), dt);
@@ -580,12 +863,24 @@ fn overlay_hud(
         overlay_text(texture, width, height, 6, y, &line, 240, true);
         y = y.saturating_add(line_height);
     }
+    for line in extra_lines {
+        overlay_text(texture, width, height, 6, y, line, 240, true);
+        y = y.saturating_add(line_height);
+    }
 }
 
 fn main() -> Result<()> {
-    let tex_width = 256;
-    let tex_height = 256;
+    let grid_size = env_usize("SIM_GRID_SIZE").filter(|value| *value > 0);
+    let tex_width = env_usize("SIM_GRID_WIDTH")
+        .filter(|value| *value > 0)
+        .or(grid_size)
+        .unwrap_or(256);
+    let tex_height = env_usize("SIM_GRID_HEIGHT")
+        .filter(|value| *value > 0)
+        .or(grid_size)
+        .unwrap_or(256);
     let headless = headless_enabled();
+    let validation = validation_case();
     let grid = MacGrid2::new(tex_width, tex_height, 1.0);
     let init = InitConfig::new(grid);
     println!("init drop_speed={:.2}", init.drop_speed);
@@ -605,26 +900,100 @@ fn main() -> Result<()> {
     let mut density_dye_scratch = Field2::new(grid.cell_grid(), 0.0);
     let mut density_mg_dye_scratch = Field2::new(grid.cell_grid(), 0.0);
     let dye_params = dye_params();
-    let particle_spacing = grid.dx() * 0.75;
+    let particle_spacing = env_f32("SIM_PARTICLE_SPACING").unwrap_or(grid.dx() * 0.75);
     let particle_jitter = 0.35;
     let pool_height_fraction = (init.base_height / (grid.height() as f32 * grid.dx())).clamp(0.1, 0.9);
-    let mut particles =
-        ParticleSystem::seed_pool(grid, pool_height_fraction, particle_spacing, particle_jitter, ParticlePhase::Liquid);
-    let mut droplet = ParticleSystem::seed_disk(
-        Vec2::new(init.drop_center.0, init.drop_center.1),
-        init.drop_radius * 0.9,
-        particle_spacing,
-        particle_jitter,
-        ParticlePhase::Liquid,
-    );
-    droplet.add_velocity(Vec2::new(0.0, init.drop_speed));
-    particles.append(droplet);
+    let dam_width_fraction = env_f32("SIM_DAM_WIDTH_FRAC").unwrap_or(0.4).clamp(0.05, 0.95);
+    let dam_height_fraction =
+        env_f32("SIM_DAM_HEIGHT_FRAC").unwrap_or(pool_height_fraction).clamp(0.05, 0.95);
+    let width = grid.width() as f32 * grid.dx();
+    let height = grid.height() as f32 * grid.dx();
+    let min_dim = width.min(height);
+    let obstacle = if validation == Some(ValidationCase::Obstacle) {
+        let obs_radius = env_f32("SIM_OBS_RADIUS").unwrap_or(min_dim * 0.08);
+        let obs_center_x = env_f32("SIM_OBS_CENTER_X").unwrap_or(0.35).clamp(0.05, 0.95);
+        let obs_center_y = env_f32("SIM_OBS_CENTER_Y").unwrap_or(0.5).clamp(0.05, 0.95);
+        let obs_bounce = env_f32("SIM_OBS_BOUNCE").unwrap_or(0.0);
+        Some(Obstacle {
+            center: Vec2::new(width * obs_center_x, height * obs_center_y),
+            radius: obs_radius,
+            bounce: obs_bounce,
+        })
+    } else {
+        None
+    };
+    let speck_start_y = if validation == Some(ValidationCase::DamBreak) {
+        (dam_height_fraction * grid.height() as f32) as usize
+    } else {
+        (pool_height_fraction * grid.height() as f32) as usize
+    };
+    let mut particles = match validation {
+        Some(ValidationCase::DamBreak) => {
+            let max = Vec2::new(width * dam_width_fraction, height * dam_height_fraction);
+            ParticleSystem::seed_rect(
+                Vec2::zero(),
+                max,
+                particle_spacing,
+                particle_jitter,
+                ParticlePhase::Liquid,
+            )
+        }
+        _ => ParticleSystem::seed_pool(
+            grid,
+            pool_height_fraction,
+            particle_spacing,
+            particle_jitter,
+            ParticlePhase::Liquid,
+        ),
+    };
+    let spawn_droplet = match validation {
+        Some(ValidationCase::DamBreak)
+        | Some(ValidationCase::Volume)
+        | Some(ValidationCase::Slosh)
+        | Some(ValidationCase::Obstacle) => false,
+        _ => true,
+    };
+    if validation == Some(ValidationCase::Slosh) {
+        let slosh_speed = env_f32("SIM_SLOSH_SPEED").unwrap_or(3.0);
+        let pool_height = height * pool_height_fraction;
+        particles.set_velocity_field(|pos| {
+            let t = (pos.y / pool_height).clamp(0.0, 1.0);
+            let u = slosh_speed * (t * std::f32::consts::FRAC_PI_2).sin();
+            Vec2::new(u, 0.0)
+        });
+    }
+    if validation == Some(ValidationCase::Obstacle) {
+        let flow_speed = env_f32("SIM_OBS_FLOW").unwrap_or(3.0);
+        particles.set_velocity_field(|_pos| Vec2::new(flow_speed, 0.0));
+    }
+    if spawn_droplet {
+        let mut droplet = ParticleSystem::seed_disk(
+            Vec2::new(init.drop_center.0, init.drop_center.1),
+            init.drop_radius * 0.9,
+            particle_spacing,
+            particle_jitter,
+            ParticlePhase::Liquid,
+        );
+        droplet.add_velocity(Vec2::new(0.0, init.drop_speed));
+        particles.append(droplet);
+    }
     let particle_bounds = ParticleBounds::from_grid(grid, grid.dx() * 0.5);
     let mut particle_grid = MacVelocity2::new(grid, Vec2::zero());
     let mut particle_prev_grid = MacVelocity2::new(grid, Vec2::zero());
-    let mut particle_density = Field2::new(grid.cell_grid(), 0.0);
-    let particle_rest_density = particles.rest_density(grid);
-    let particle_base_flags = CellFlags::new(grid.cell_grid(), CellType::Fluid);
+    let particle_base_flags = if let Some(obs) = obstacle {
+        CellFlags::from_fn(grid.cell_grid(), |x, y| {
+            let (cx, cy) = grid.cell_center(x, y);
+            let dx = cx - obs.center.x;
+            let dy = cy - obs.center.y;
+            if dx * dx + dy * dy <= obs.radius * obs.radius {
+                CellType::Solid
+            } else {
+                CellType::Fluid
+            }
+        })
+    } else {
+        CellFlags::new(grid.cell_grid(), CellType::Fluid)
+    };
     println!(
         "dye params diffusion={:.6} decay={:.6} air_decay={:.6} base={:.3} reinject={:.3}",
         dye_params.diffusion,
@@ -683,13 +1052,126 @@ fn main() -> Result<()> {
         target_volume,
         volume_band: surface_band,
     };
-    let particle_dt = env_f32("SIM_PARTICLE_DT").unwrap_or(0.02);
-    let particle_flip_ratio = env_f32("SIM_FLIP_RATIO").unwrap_or(0.0);
+    let particle_dt = env_f32("SIM_PARTICLE_DT").unwrap_or(0.03);
+    let mut particle_gravity = env_f32("SIM_PARTICLE_GRAVITY").unwrap_or(-9.8);
+    if matches!(validation, Some(ValidationCase::Volume | ValidationCase::Obstacle))
+        && std::env::var("SIM_PARTICLE_GRAVITY").ok().is_none()
+    {
+        particle_gravity = 0.0;
+    }
+    let particle_flip_ratio = env_f32("SIM_FLIP_RATIO").unwrap_or(0.05);
     let particle_bounce = env_f32("SIM_PARTICLE_BOUNCE").unwrap_or(0.0);
-    let particle_density_scale = env_f32("SIM_PARTICLE_DENSITY_SCALE").unwrap_or(1.0);
-    let particle_liquid_threshold = env_f32("SIM_PARTICLE_LIQUID_THRESHOLD").unwrap_or(0.2);
-    let particle_pressure_iters = env_usize("SIM_PARTICLE_PRESSURE_ITERS").unwrap_or(40);
+    let particle_pressure_iters = env_usize("SIM_PARTICLE_PRESSURE_ITERS").unwrap_or(60);
     let particle_pressure_tol = env_f32("SIM_PARTICLE_PRESSURE_TOL").unwrap_or(1e-4);
+    let particle_extrap_iters = env_usize("SIM_PARTICLE_EXTRAP_ITERS").unwrap_or(2);
+    let particle_separation = env_f32("SIM_PARTICLE_SEPARATION")
+        .unwrap_or(particle_spacing * 1.0);
+    let particle_separation_iters =
+        env_usize("SIM_PARTICLE_SEPARATION_ITERS").unwrap_or(2);
+    let particle_separation_every =
+        env_usize("SIM_PARTICLE_SEPARATION_EVERY").unwrap_or(2);
+    let particle_pls_reinit_iters =
+        env_usize("SIM_PARTICLE_PLS_REINIT_ITERS").unwrap_or(3);
+    let particle_pls_reinit_dt =
+        env_f32("SIM_PARTICLE_PLS_REINIT_DT").unwrap_or(0.3);
+    let particle_volume_blend = env_f32("SIM_PARTICLE_VOLUME_BLEND").unwrap_or(0.0);
+    let particle_ls_radius = env_f32("SIM_PARTICLE_LS_RADIUS").unwrap_or(particle_spacing * 0.6);
+    let particle_ls_max = env_f32("SIM_PARTICLE_LS_MAX").unwrap_or(particle_ls_radius * 4.0);
+    let particle_surface_band =
+        env_f32("SIM_PARTICLE_SURFACE_BAND").unwrap_or(particle_ls_radius * 0.75);
+    let particle_volume_band =
+        env_f32("SIM_PARTICLE_VOLUME_BAND").unwrap_or(particle_ls_radius * 2.0);
+    let particle_occ_scale = env_f32("SIM_PARTICLE_OCC_SCALE").unwrap_or(1.0);
+    let particle_occ_threshold = env_f32("SIM_PARTICLE_OCC_THRESHOLD").unwrap_or(0.32);
+    let particle_flag_threshold = env_f32("SIM_PARTICLE_FLAG_THRESHOLD")
+        .unwrap_or(particle_occ_threshold * 0.5)
+        .min(particle_occ_threshold);
+    let particle_rest_density = particles.rest_density(grid);
+    let particle_render_volume = env_usize("SIM_PARTICLE_RENDER_VOLUME").unwrap_or(1) != 0;
+    let particle_pbf_radius = env_f32("SIM_PARTICLE_PBF_RADIUS")
+        .unwrap_or(particle_spacing * 1.3);
+    let particle_render_mode = env_string("SIM_PARTICLE_RENDER")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "phi".to_string());
+    let particle_render_radius =
+        env_f32("SIM_PARTICLE_RENDER_RADIUS").unwrap_or(particle_pbf_radius);
+    let particle_render_scale = env_f32("SIM_PARTICLE_RENDER_SCALE").unwrap_or(1.0);
+    let particle_pbf_iters = env_usize("SIM_PARTICLE_PBF_ITERS").unwrap_or(6);
+    let particle_pbf_every = env_usize("SIM_PARTICLE_PBF_EVERY").unwrap_or(1);
+    let particle_pbf_scorr_k = env_f32("SIM_PARTICLE_PBF_SCORR_K").unwrap_or(0.001);
+    let particle_pbf_scorr_n = env_f32("SIM_PARTICLE_PBF_SCORR_N").unwrap_or(4.0);
+    let particle_pbf_scorr_q = env_f32("SIM_PARTICLE_PBF_SCORR_Q").unwrap_or(0.2);
+    let particle_pbf_rest = particles.pbf_rest_density(particle_bounds, particle_pbf_radius);
+    let particle_render_rest = particles.rest_sph_density(grid, particle_render_radius);
+    let particle_apic = env_usize("SIM_PARTICLE_APIC").unwrap_or(1) != 0;
+    let particle_apic_clamp = env_f32("SIM_PARTICLE_APIC_CLAMP").unwrap_or(6.0);
+    let particle_xsph = env_f32("SIM_PARTICLE_XSPH").unwrap_or(0.02);
+    let particle_xsph_radius =
+        env_f32("SIM_PARTICLE_XSPH_RADIUS").unwrap_or(particle_pbf_radius);
+    let particle_resample = env_usize("SIM_PARTICLE_RESAMPLE").unwrap_or(1) != 0;
+    let particle_resample_every = env_usize("SIM_PARTICLE_RESAMPLE_EVERY").unwrap_or(2).max(1);
+    let particle_resample_low =
+        env_f32("SIM_PARTICLE_RESAMPLE_LOW").unwrap_or(particle_occ_threshold * 0.7);
+    let particle_resample_high =
+        env_f32("SIM_PARTICLE_RESAMPLE_HIGH").unwrap_or(particle_occ_threshold * 1.4);
+    let particle_resample_max = env_usize("SIM_PARTICLE_RESAMPLE_MAX")
+        .unwrap_or((grid.width() / 2).max(64));
+    let particle_resample_jitter =
+        env_f32("SIM_PARTICLE_RESAMPLE_JITTER").unwrap_or(particle_spacing * 0.35);
+    let particle_resample_seed = env_usize("SIM_PARTICLE_RESAMPLE_SEED").unwrap_or(0) as u32;
+    let particle_target_count = particles.len();
+    let particle_post_project = env_usize("SIM_PARTICLE_POST_PBF_PROJECT").unwrap_or(1) != 0;
+    let particle_post_project_iters = env_usize("SIM_PARTICLE_POST_PBF_ITERS").unwrap_or(30);
+    let particle_surface_clean = env_usize("SIM_PARTICLE_SURFACE_CLEAN").unwrap_or(1) != 0;
+    let particle_surface_strong =
+        env_f32("SIM_PARTICLE_SURFACE_STRONG").unwrap_or(0.5);
+    let particle_surface_weak = env_f32("SIM_PARTICLE_SURFACE_WEAK").unwrap_or(0.35);
+    let particle_surface_neighbors =
+        env_usize("SIM_PARTICLE_SURFACE_NEIGHBORS").unwrap_or(4);
+    let particle_air_drag = env_f32("SIM_PARTICLE_AIR_DRAG").unwrap_or(1.5);
+    let particle_air_threshold =
+        env_f32("SIM_PARTICLE_AIR_THRESHOLD").unwrap_or(particle_occ_threshold * 0.6);
+    let particle_cfl = env_f32("SIM_PARTICLE_CFL").unwrap_or(0.5);
+    let particle_max_vel = env_f32("SIM_PARTICLE_MAX_VEL").unwrap_or(200.0);
+    let particle_gpu_p2g = env_usize("SIM_GPU_P2G").unwrap_or(1) != 0;
+    let particle_gpu_p2g_scale = env_f32("SIM_GPU_P2G_SCALE").unwrap_or(1024.0);
+    let validate_speck_threshold =
+        env_f32("SIM_VALIDATE_SPECK_THRESHOLD").unwrap_or(particle_occ_threshold);
+    let particle_boundary_mode = env_string("SIM_PARTICLE_BOUNDARY")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "slip".to_string());
+    let particle_hud_lines = vec![
+        format!("RENDER {}", particle_render_mode.to_ascii_uppercase()),
+        format!("BOUND {}", particle_boundary_mode.to_ascii_uppercase()),
+        format!("APIC {}", if particle_apic { "ON" } else { "OFF" }),
+        format!("GPU P2G {}", if particle_gpu_p2g { "ON" } else { "OFF" }),
+    ];
+    let particle_boundary_config = match particle_boundary_mode.as_str() {
+        "no_slip" | "noslip" => BoundaryConfig::no_slip(),
+        _ => BoundaryConfig {
+            left: BoundaryCondition::Slip,
+            right: BoundaryCondition::Slip,
+            bottom: BoundaryCondition::Slip,
+            top: BoundaryCondition::Slip,
+        },
+    };
+    let (mut particle_density, particle_target_volume) = {
+        let phi = particle_level_set_from_particles(
+            &particles,
+            grid,
+            particle_bounds,
+            particle_ls_radius,
+            particle_ls_max,
+            particle_pls_reinit_iters,
+            particle_pls_reinit_dt,
+            particle_volume_blend,
+            particle_volume_band,
+            None,
+        );
+        let density = display_phi(&phi, particle_surface_band);
+        let volume = volume_from_phi(&phi, particle_surface_band);
+        (density, volume)
+    };
     let density_surface_params = LevelSetParams {
         dt: density_params.dt,
         cfl: density_params.cfl,
@@ -724,19 +1206,31 @@ fn main() -> Result<()> {
         pcg_iters: 0,
         pcg_tol: 0.0,
     };
-    let mut mode = start_mode();
+    let mut mode = if validation.is_some() {
+        SimMode::Particles
+    } else {
+        start_mode()
+    };
     let mut texture = Vec::new();
     let density_steps_per_frame = 4;
     let level_steps_per_frame = 4;
-    let particle_steps_per_frame = 2;
+    let particle_steps_per_frame = env_usize("SIM_PARTICLE_STEPS").unwrap_or(2).max(1);
     let mut frame_count: u64 = 0;
     let mut avg_frame_ms = 0.0;
     let mut avg_sim_ms = 0.0;
+    let mut particle_step_counter: u64 = 0;
+    let mut particle_volume_raw = 0.0;
+    let mut particle_volume_rendered = 0.0;
+    let mut particle_dt_effective = particle_dt;
+    let mut particle_resample_added = 0usize;
+    let mut particle_resample_removed = 0usize;
+    let validation_metrics = Rc::new(RefCell::new(validation.map(ValidationMetrics::new)));
+    let metrics_handle = validation_metrics.clone();
     let mut step_frame = move |mode: SimMode,
                           frame_count: &mut u64,
                           avg_frame_ms: &mut f32,
                           avg_sim_ms: &mut f32,
-                          app: Option<&mut VulkanApp>| {
+                          mut app: Option<&mut VulkanApp>| {
         let frame_start = Instant::now();
         let sim_start = Instant::now();
         let before_stats = if *frame_count == 0 {
@@ -744,7 +1238,7 @@ fn main() -> Result<()> {
                 SimMode::Density => density_state.density.stats(),
                 SimMode::LevelSet => level_state.phi.stats(),
                 SimMode::DensityMg => density_mg_state.density.stats(),
-                SimMode::Particles => particle_density.stats(),
+                SimMode::Particles | SimMode::ParticlesGpu => particle_density.stats(),
             })
         } else {
             None
@@ -876,21 +1370,75 @@ fn main() -> Result<()> {
                 );
                 (dt_display, density_mg_params.cfl, mg_params.cycles)
             }
-            SimMode::Particles => {
+            SimMode::Particles | SimMode::ParticlesGpu => {
+                let use_gpu = mode == SimMode::ParticlesGpu;
+                particle_resample_added = 0;
+                particle_resample_removed = 0;
                 for _ in 0..particle_steps_per_frame {
-                    let density_flags =
-                        particles.to_density_with_rest(grid, particle_density_scale, particle_rest_density);
-                    let particle_flags = flags_from_density(
-                        &density_flags,
-                        &particle_base_flags,
-                        particle_liquid_threshold,
+                    let mut dt_step = particle_dt;
+                    if particle_cfl > 0.0 {
+                        let mut max_vel = particle_grid.max_abs();
+                        if !max_vel.is_finite() {
+                            max_vel = 0.0;
+                        }
+                        let particle_vel = particles.max_speed();
+                        if particle_vel.is_finite() {
+                            max_vel = max_vel.max(particle_vel);
+                        }
+                        if max_vel > 0.0 {
+                            let dx = particle_grid.grid().dx();
+                            dt_step = dt_step.min(particle_cfl * dx / max_vel);
+                        }
+                    }
+                    particle_dt_effective = dt_step;
+                    particles.add_velocity(Vec2::new(0.0, particle_gravity * dt_step));
+                    let particle_occ = particles.to_density_with_rest(
+                        grid,
+                        particle_occ_scale,
+                        particle_rest_density,
                     );
-                    particle_grid = particles.to_grid(grid);
-                    particle_grid =
-                        apply_domain_boundaries(&particle_grid, BoundaryConfig::no_slip());
-                    particle_grid.v_mut().update_with_index(|_x, _y, value| {
-                        value + -9.8 * particle_dt
+                    let particle_flags = CellFlags::from_fn(grid.cell_grid(), |x, y| {
+                        match particle_base_flags.get(x, y) {
+                            CellType::Solid => CellType::Solid,
+                            _ => {
+                                let occ = particle_occ.get(x, y);
+                                if occ >= particle_flag_threshold {
+                                    CellType::Fluid
+                                } else {
+                                    CellType::Air
+                                }
+                            }
+                        }
                     });
+                    let mut gpu_grid = None;
+                    if use_gpu && particle_gpu_p2g {
+                        let gpu_result = app
+                            .as_deref_mut()
+                            .map(|app| {
+                                app.particle_grid_gpu(&particles, grid, particle_gpu_p2g_scale)
+                            })
+                            .unwrap_or_else(|| {
+                                Err(anyhow::anyhow!(
+                                    "gpu p2g requires a renderer for mode 5"
+                                ))
+                            });
+                        match gpu_result {
+                            Ok(grid_vel) => gpu_grid = Some(grid_vel),
+                            Err(err) => {
+                                eprintln!("gpu p2g error: {err:#}");
+                            }
+                        }
+                    }
+                    particle_grid = if let Some(grid_vel) = gpu_grid {
+                        grid_vel
+                    } else if particle_apic {
+                        particles.to_grid_apic(grid)
+                    } else {
+                        particles.to_grid(grid)
+                    };
+                    particle_grid =
+                        apply_domain_boundaries(&particle_grid, particle_boundary_config);
+                    particle_grid = apply_solid_boundaries(&particle_grid, &particle_flags);
                     particle_prev_grid.clone_from(&particle_grid);
                     particle_grid = project_with_flags(
                         &particle_grid,
@@ -898,24 +1446,282 @@ fn main() -> Result<()> {
                         particle_pressure_iters,
                         particle_pressure_tol,
                     );
+                    if particle_extrap_iters > 0 {
+                        particle_grid = extrapolate_velocity(
+                            &particle_grid,
+                            &particle_flags,
+                            particle_extrap_iters,
+                        );
+                    }
                     particle_grid =
-                        apply_domain_boundaries(&particle_grid, BoundaryConfig::no_slip());
-                    particles.update_velocities_from_grid(
-                        &particle_grid,
-                        Some(&particle_prev_grid),
-                        particle_flip_ratio,
-                    );
-                    particles.advect_rk2_grid(
-                        &particle_grid,
-                        particle_dt,
-                        particle_bounds,
-                        particle_bounce,
-                    );
+                        apply_domain_boundaries(&particle_grid, particle_boundary_config);
+                    particle_grid = apply_solid_boundaries(&particle_grid, &particle_flags);
+                    if particle_apic {
+                        particles.update_velocities_from_grid_apic(
+                            &particle_grid,
+                            Some(&particle_prev_grid),
+                            particle_flip_ratio,
+                        );
+                        particles.clamp_affines(particle_apic_clamp);
+                    } else {
+                        particles.update_velocities_from_grid(
+                            &particle_grid,
+                            Some(&particle_prev_grid),
+                            particle_flip_ratio,
+                        );
+                    }
+                    let do_pbf = particle_pbf_iters > 0
+                        && particle_pbf_every > 0
+                        && (particle_step_counter % particle_pbf_every as u64) == 0;
+                    let prev_positions = if do_pbf {
+                        Some(particles.positions().to_vec())
+                    } else {
+                        None
+                    };
+                    if use_gpu {
+                        let gpu_result = app
+                            .as_deref_mut()
+                            .map(|app| {
+                                app.update_particles_gpu(
+                                    &mut particles,
+                                    grid,
+                                    particle_bounds,
+                                    dt_step,
+                                    particle_bounce,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                Err(anyhow::anyhow!("gpu particle step requires a renderer"))
+                            });
+                        if let Err(err) = gpu_result {
+                            eprintln!("gpu particle step error: {err:#}");
+                            particles.advect_rk2_grid(
+                                &particle_grid,
+                                dt_step,
+                                particle_bounds,
+                                particle_bounce,
+                            );
+                        }
+                    } else {
+                        particles.advect_rk2_grid(
+                            &particle_grid,
+                            dt_step,
+                            particle_bounds,
+                            particle_bounce,
+                        );
+                    }
+                    if do_pbf {
+                        if let Some(prev_positions) = prev_positions.as_deref() {
+                            particles.pbf_project(
+                                particle_bounds,
+                                particle_pbf_radius,
+                                particle_pbf_rest,
+                                particle_pbf_iters,
+                                dt_step,
+                                particle_bounce,
+                                particle_pbf_scorr_k,
+                                particle_pbf_scorr_n,
+                                particle_pbf_scorr_q,
+                                prev_positions,
+                            );
+                        }
+                    } else if particle_separation_iters > 0
+                        && particle_separation_every > 0
+                        && (particle_step_counter % particle_separation_every as u64) == 0
+                    {
+                        particles.separate(
+                            particle_separation,
+                            particle_bounds,
+                            particle_separation_iters,
+                        );
+                    }
+                    let do_resample = particle_resample
+                        && (particle_step_counter % particle_resample_every as u64) == 0;
+                    let mut occ_resample = None;
+                    if do_resample {
+                        let occ_field = particles.to_density_with_rest(
+                            grid,
+                            particle_occ_scale,
+                            particle_rest_density,
+                        );
+                        let (added, removed) = particles.resample_volume(
+                            grid,
+                            particle_bounds,
+                            &occ_field,
+                            &particle_grid,
+                            particle_target_count,
+                            particle_flag_threshold,
+                            particle_resample_low,
+                            particle_resample_high,
+                            particle_resample_max,
+                            particle_resample_jitter,
+                            particle_resample_seed ^ particle_step_counter as u32,
+                        );
+                        particle_resample_added += added;
+                        particle_resample_removed += removed;
+                        occ_resample = Some(occ_field);
+                    }
+                    if let Some(obs) = obstacle {
+                        particles.apply_circle_obstacle(obs.center, obs.radius, obs.bounce);
+                    }
+                    if particle_post_project {
+                        particle_grid = if particle_apic {
+                            particles.to_grid_apic(grid)
+                        } else {
+                            particles.to_grid(grid)
+                        };
+                        particle_grid =
+                            apply_domain_boundaries(&particle_grid, particle_boundary_config);
+                        particle_grid = apply_solid_boundaries(&particle_grid, &particle_flags);
+                        particle_grid = project_with_flags(
+                            &particle_grid,
+                            &particle_flags,
+                            particle_post_project_iters,
+                            particle_pressure_tol,
+                        );
+                        if particle_extrap_iters > 0 {
+                            particle_grid = extrapolate_velocity(
+                                &particle_grid,
+                                &particle_flags,
+                                particle_extrap_iters,
+                            );
+                        }
+                        particle_grid =
+                            apply_domain_boundaries(&particle_grid, particle_boundary_config);
+                        particle_grid = apply_solid_boundaries(&particle_grid, &particle_flags);
+                        if particle_apic {
+                            particles.update_velocities_from_grid_apic(&particle_grid, None, 0.0);
+                            particles.clamp_affines(particle_apic_clamp);
+                        } else {
+                            particles.update_velocities_from_grid(&particle_grid, None, 0.0);
+                        }
+                    }
+                    if particle_air_drag > 0.0 {
+                        let occ_drag = if let Some(ref occ) = occ_resample {
+                            occ
+                        } else {
+                            occ_resample.get_or_insert_with(|| {
+                                particles.to_density_with_rest(
+                                    grid,
+                                    particle_occ_scale,
+                                    particle_rest_density,
+                                )
+                            })
+                        };
+                        particles.apply_air_drag(
+                            occ_drag,
+                            particle_air_threshold,
+                            particle_air_drag,
+                            dt_step,
+                        );
+                    }
+                    if particle_xsph > 0.0 {
+                        particles.xsph_viscosity(
+                            particle_bounds,
+                            particle_xsph_radius,
+                            particle_xsph,
+                        );
+                    }
+                    if particle_max_vel > 0.0 {
+                        particles.clamp_speeds(particle_max_vel);
+                    }
+                    particle_step_counter = particle_step_counter.wrapping_add(1);
                 }
-                particle_density =
-                    particles.to_density_with_rest(grid, particle_density_scale, particle_rest_density);
+                let particle_phi = particle_level_set_from_particles(
+                    &particles,
+                    grid,
+                    particle_bounds,
+                    particle_ls_radius,
+                    particle_ls_max,
+                    particle_pls_reinit_iters,
+                    particle_pls_reinit_dt,
+                    particle_volume_blend,
+                    particle_volume_band,
+                    Some((particle_target_volume, particle_surface_band)),
+                );
+                particle_volume_raw = volume_from_phi(&particle_phi, particle_surface_band);
+                if particle_render_mode == "sph" {
+                    let mut density = particles.to_sph_density_with_rest(
+                        grid,
+                        particle_render_radius,
+                        particle_render_scale,
+                        particle_render_rest,
+                    );
+                    let particle_occ = particles.to_density_with_rest(
+                        grid,
+                        particle_occ_scale,
+                        particle_rest_density,
+                    );
+                    density.update_with_index(|x, y, value| {
+                        if particle_occ.get(x, y) >= particle_occ_threshold {
+                            value
+                        } else {
+                            0.0
+                        }
+                    });
+                    let current_sum = density.sum();
+                    if current_sum > 0.0 && particle_target_volume > 0.0 {
+                        density.scale_in_place(particle_target_volume / current_sum);
+                    }
+                    clamp_field_in_place(&mut density, 0.0, 1.0);
+                    if particle_surface_clean {
+                        apply_surface_hysteresis(
+                            &mut density,
+                            particle_surface_strong,
+                            particle_surface_weak,
+                            particle_surface_neighbors,
+                        );
+                    }
+                    let filtered_sum = density.sum();
+                    if filtered_sum > 0.0 && particle_target_volume > 0.0 {
+                        density.scale_in_place(particle_target_volume / filtered_sum);
+                        clamp_field_in_place(&mut density, 0.0, 1.0);
+                    }
+                    particle_volume_rendered = density.sum();
+                    particle_density = density;
+                } else {
+                    let render_phi = if particle_render_volume {
+                        let corrected = correct_phi_volume(
+                            &particle_phi,
+                            particle_target_volume,
+                            particle_surface_band,
+                        );
+                        if particle_volume_band > 0.0 {
+                            corrected.zip_with(&particle_phi, |corr, orig| {
+                                if orig.abs() <= particle_volume_band {
+                                    corr
+                                } else {
+                                    orig
+                                }
+                            })
+                        } else {
+                            corrected
+                        }
+                    } else {
+                        particle_phi
+                    };
+                    particle_volume_rendered = volume_from_phi(&render_phi, particle_surface_band);
+                    particle_density = display_phi(&render_phi, particle_surface_band);
+                }
+                if let Some(metrics) = metrics_handle.borrow_mut().as_mut() {
+                    let div = divergence(&particle_grid).abs_sum();
+                    metrics.frames += 1;
+                    metrics.max_div = metrics.max_div.max(div);
+                    metrics.min_vol_raw = metrics.min_vol_raw.min(particle_volume_raw);
+                    metrics.max_vol_raw = metrics.max_vol_raw.max(particle_volume_raw);
+                    let speck_field = particles.to_density_with_rest(
+                        grid,
+                        particle_occ_scale,
+                        particle_rest_density,
+                    );
+                    let specks =
+                        count_surface_specks(&speck_field, validate_speck_threshold, speck_start_y);
+                    metrics.specks_sum += specks;
+                    metrics.specks_max = metrics.specks_max.max(specks);
+                    metrics.samples += 1;
+                }
                 density_to_luma(&particle_density, &mut texture);
-                (particle_dt, 0.0, 0)
+                (particle_dt_effective, 0.0, 0)
             }
         };
         if let Some((sum_before, min_before, max_before, non_finite_before)) = before_stats {
@@ -923,7 +1729,7 @@ fn main() -> Result<()> {
                 SimMode::Density => density_state.density.stats(),
                 SimMode::LevelSet => level_state.phi.stats(),
                 SimMode::DensityMg => density_mg_state.density.stats(),
-                SimMode::Particles => particle_density.stats(),
+                SimMode::Particles | SimMode::ParticlesGpu => particle_density.stats(),
             };
             println!(
                 "init mode={} sum={:.2}->{:.2} min={:.3}->{:.3} max={:.3}->{:.3} nonfinite={} -> {}",
@@ -963,6 +1769,11 @@ fn main() -> Result<()> {
             iters_display,
             fps,
             *avg_sim_ms,
+            if matches!(mode, SimMode::Particles | SimMode::ParticlesGpu) {
+                &particle_hud_lines
+            } else {
+                &[]
+            },
         );
         *frame_count += 1;
                 if (*frame_count).is_multiple_of(10) {
@@ -988,7 +1799,7 @@ fn main() -> Result<()> {
                             Some(density_mg_dye.stats()),
                             dye_center(&density_mg_dye),
                         ),
-                        SimMode::Particles => (
+                        SimMode::Particles | SimMode::ParticlesGpu => (
                             particles.len() as f32,
                             divergence(&particle_grid).abs_sum(),
                             particle_grid.max_abs(),
@@ -1004,7 +1815,7 @@ fn main() -> Result<()> {
                     surface_height_avg(&density_mg_state.density, density_threshold)
                 }
                 SimMode::LevelSet => None,
-                SimMode::Particles => None,
+                SimMode::Particles | SimMode::ParticlesGpu => None,
             };
             let surf_label = surf_height
                 .map(|value| format!(" surf_y={:.2}", value))
@@ -1023,7 +1834,9 @@ fn main() -> Result<()> {
                     init.base_height,
                 ),
                 SimMode::LevelSet => None,
-                SimMode::Particles => None,
+                SimMode::Particles | SimMode::ParticlesGpu => {
+                    particle_droplet_vy_stats(&particles, init.base_height)
+                }
             };
             let droplet_center = match mode {
                 SimMode::Density => {
@@ -1033,7 +1846,9 @@ fn main() -> Result<()> {
                     droplet_center(&density_mg_state.density, density_threshold, init.base_height)
                 }
                 SimMode::LevelSet => None,
-                SimMode::Particles => None,
+                SimMode::Particles | SimMode::ParticlesGpu => {
+                    particle_droplet_center(&particles, init.base_height)
+                }
             };
             let droplet_label = droplet_stats
                 .map(|(avg_vy, max_vy, count)| {
@@ -1046,10 +1861,30 @@ fn main() -> Result<()> {
             let droplet_center_label = droplet_center
                 .map(|(cx, cy)| format!(" drop_center=({:.2},{:.2})", cx, cy))
                 .unwrap_or_default();
+            let particle_volume_label = match mode {
+                SimMode::Particles | SimMode::ParticlesGpu => format!(
+                    " vol_raw={:.2} vol_render={:.2}",
+                    particle_volume_raw, particle_volume_rendered
+                ),
+                _ => String::new(),
+            };
+            let particle_resample_label = match mode {
+                SimMode::Particles | SimMode::ParticlesGpu => {
+                    if particle_resample_added > 0 || particle_resample_removed > 0 {
+                        format!(
+                            " resample=+{}-{}",
+                            particle_resample_added, particle_resample_removed
+                        )
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => String::new(),
+            };
             if let Some((dye_sum, dye_min, dye_max, dye_nonfinite)) = dye_stats {
                 if let Some((cx, cy)) = dye_center {
                     println!(
-                        "frame {} mode={} sim_ms={:.2} frame_ms={:.2} fps={:.1} mass={:.2} div={:.2} vel_max={:.2} dye_sum={:.2} dye_min={:.3} dye_max={:.3} dye_nf={} dye_center=({:.2},{:.2}){}{}{}",
+                        "frame {} mode={} sim_ms={:.2} frame_ms={:.2} fps={:.1} mass={:.2} div={:.2} vel_max={:.2} dye_sum={:.2} dye_min={:.3} dye_max={:.3} dye_nf={} dye_center=({:.2},{:.2}){}{}{}{}{}",
                         *frame_count,
                         mode.tag(),
                         *avg_sim_ms,
@@ -1066,11 +1901,13 @@ fn main() -> Result<()> {
                         cy,
                         surf_label,
                         droplet_label,
-                        droplet_center_label
+                        droplet_center_label,
+                        particle_volume_label,
+                        particle_resample_label
                     );
                 } else {
                     println!(
-                        "frame {} mode={} sim_ms={:.2} frame_ms={:.2} fps={:.1} mass={:.2} div={:.2} vel_max={:.2} dye_sum={:.2} dye_min={:.3} dye_max={:.3} dye_nf={}{}{}{}",
+                        "frame {} mode={} sim_ms={:.2} frame_ms={:.2} fps={:.1} mass={:.2} div={:.2} vel_max={:.2} dye_sum={:.2} dye_min={:.3} dye_max={:.3} dye_nf={}{}{}{}{}{}",
                         *frame_count,
                         mode.tag(),
                         *avg_sim_ms,
@@ -1085,12 +1922,14 @@ fn main() -> Result<()> {
                         dye_nonfinite,
                         surf_label,
                         droplet_label,
-                        droplet_center_label
+                        droplet_center_label,
+                        particle_volume_label,
+                        particle_resample_label
                     );
                 }
             } else {
                 println!(
-                    "frame {} mode={} sim_ms={:.2} frame_ms={:.2} fps={:.1} mass={:.2} div={:.2} vel_max={:.2}{}{}{}",
+                    "frame {} mode={} sim_ms={:.2} frame_ms={:.2} fps={:.1} mass={:.2} div={:.2} vel_max={:.2}{}{}{}{}{}",
                     *frame_count,
                     mode.tag(),
                     *avg_sim_ms,
@@ -1101,7 +1940,9 @@ fn main() -> Result<()> {
                     vel_max,
                     surf_label,
                     droplet_label,
-                    droplet_center_label
+                    droplet_center_label,
+                    particle_volume_label,
+                    particle_resample_label
                 );
             }
                     if dump_enabled() {
@@ -1142,7 +1983,7 @@ fn main() -> Result<()> {
                             );
                                 }
                             }
-                            SimMode::Particles => {
+                            SimMode::Particles | SimMode::ParticlesGpu => {
                                 if dump_mode == DumpField::Density || dump_mode == DumpField::Both {
                                     dump_matrix(
                                         "matrix particles",
@@ -1155,7 +1996,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-        if let Some(app) = app {
+        if let Some(app) = app.as_deref_mut() {
             if let Err(err) = app.update_texture(&texture) {
                 eprintln!("texture upload error: {err:#}");
             }
@@ -1175,6 +2016,25 @@ fn main() -> Result<()> {
                 &mut avg_frame_ms,
                 &mut avg_sim_ms,
                 None,
+            );
+        }
+        if let Some(metrics) = validation_metrics.borrow_mut().take() {
+            let samples = metrics.samples.max(1) as f32;
+            let specks_avg = metrics.specks_sum as f32 / samples;
+            let volume_loss = if particle_target_volume > 0.0 {
+                ((particle_target_volume - metrics.min_vol_raw) / particle_target_volume).max(0.0)
+            } else {
+                0.0
+            };
+            println!(
+                "validation case={} frames={} vol_raw_min={:.2} vol_loss_pct={:.2} max_div={:.2} specks_avg={:.2} specks_max={}",
+                metrics.case.label(),
+                metrics.frames,
+                metrics.min_vol_raw,
+                volume_loss * 100.0,
+                metrics.max_div,
+                specks_avg,
+                metrics.specks_max
             );
         }
         return Ok(());
@@ -1215,6 +2075,9 @@ fn main() -> Result<()> {
                         }
                         winit::event::VirtualKeyCode::Key4 => {
                             mode = SimMode::Particles;
+                        }
+                        winit::event::VirtualKeyCode::Key5 => {
+                            mode = SimMode::ParticlesGpu;
                         }
                         _ => {}
                     }

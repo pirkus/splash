@@ -15,12 +15,12 @@ pub use grid::Grid2;
 pub use hud::{overlay_text, GLYPH_HEIGHT, GLYPH_SPACING, GLYPH_WIDTH, LINE_SPACING};
 pub use level_set::{
     advect_level_set_surface_in_place, flags_from_phi, level_set_step, level_set_step_in_place,
-    phi_to_density, reinitialize_phi, volume_from_phi, LevelSetParams, LevelSetState,
-    LevelSetWorkspace,
+    correct_phi_volume, phi_to_density, reinitialize_phi, volume_from_phi, LevelSetParams,
+    LevelSetState, LevelSetWorkspace,
 };
 pub use mac_sim::{
-    divergence, flags_from_density, project_with_flags, sharpen_density, step, step_in_place,
-    AdvectionScheme, MacSimParams, MacSimState, MacSimWorkspace,
+    divergence, extrapolate_velocity, flags_from_density, project_with_flags, sharpen_density,
+    step, step_in_place, AdvectionScheme, MacSimParams, MacSimState, MacSimWorkspace,
 };
 pub use mac_sim_mg::{step_in_place_mg, step_mg, MacSimMgWorkspace, MultigridParams};
 pub use particles::{ParticleBounds, ParticlePhase, ParticleSystem};

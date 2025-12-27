@@ -2,7 +2,7 @@
 Status legend: [x] done, [~] in progress, [ ] not started
 
 ## Phase 1: Minimal 2D Incompressible Solver (Stokes / Low-Re)
-1. [x] Define the numerical model (2D incompressible, constant density/viscosity, unit square domain).
+1. [x] Define the numerical model (2D incompressible, constant density/viscosity, grid in cell units).
 2. [x] Pick a stable baseline discretization (MAC grid + finite differences). MAC grid integrated into the main solver.
 3. [x] Implement core data structures (grid, fields, boundary flags). MAC grid + flags wired into the solver.
 4. [x] Implement diffusion step (implicit or explicit with CFL limit). Current: explicit diffusion.
@@ -14,25 +14,24 @@ Status legend: [x] done, [~] in progress, [ ] not started
 1. [x] Add CFL-based `dt` clamp in the MAC step.
 2. [x] Add boundary-aware pressure solve (solid-aware Poisson).
 3. [x] Add regression for mass conservation (density sum stays stable with no sources).
-4. [x] Add a short solver validation doc with expected qualitative behavior.
 
 ## Phase 1.9: Performance and Instrumentation
-1. [ ] Parallelize core field ops with `rayon` while preserving functional style.
-2. [ ] Add reusable solver workspace to reduce allocations in advection/diffusion.
-3. [ ] Use adaptive pressure iterations based on residual instead of fixed `pressure_iters`.
+1. [x] Parallelize core field ops with `rayon` while preserving functional style.
+2. [x] Add reusable solver workspace to reduce allocations in advection/diffusion.
+3. [x] Use adaptive pressure iterations based on residual instead of fixed `pressure_iters`.
 
 ## Phase 2: Full 2D Navier-Stokes
 1. [x] Add advection (semi-Lagrangian or RK2/3 with backtracing). Current: semi-Lagrangian.
 2. [x] Add external forces (body forces, buoyancy).
 3. [x] Improve pressure solve (preconditioned conjugate gradient).
-4. [x] Add basic visualization (velocity magnitude, vorticity).
+4. [ ] Add basic visualization (velocity magnitude, vorticity).
 5. [~] Add a Vulkan-based windowed 2D renderer (live field display with pan/zoom, plus a simple interaction: mouse drag injects velocity and click adds a density puff). Current: window + swapchain + textured fullscreen quad with live density.
    - [x] Upload scalar fields as textures and render via fullscreen quad.
-   - [ ] Add a debug overlay (FPS, dt, CFL, solver iterations).
+   - [x] Add a debug overlay (FPS, dt, CFL, solver iterations).
    - [ ] Add input mapping and a configurable brush (radius, strength, density amount).
    - [ ] Add deterministic interaction capture/replay for debugging.
    - [ ] Add render tests (offscreen render + image checksum in CI).
-6. [ ] Add timestep control (CFL-based adaptive dt).
+6. [x] Add timestep control (CFL-based adaptive dt).
 
 ## Phase 3: Better Accuracy and Stability
 1. [x] Switch to higher-order advection (BFECC or MacCormack).
@@ -46,16 +45,22 @@ Status legend: [x] done, [~] in progress, [ ] not started
 2. [x] Implement PIC/FLIP/APIC transfers (P2G, G2P) on MAC grid.
 3. [x] Integrate particles (RK2/RK3 advection) with boundary handling.
 4. [x] Pressure projection on the grid (reuse existing solver, tuned for liquid region).
-5. [ ] Surface reconstruction for rendering (splash sheet, density/level set from particles).
+5. [x] Surface reconstruction for rendering (particle level set via SPH density + reinit).
 6. [ ] Add drop injection and interaction controls (click to add droplets).
-7. [ ] Add validation cases (dam break, drop impact, volume conservation).
+7. [x] Add validation cases (dam break, drop impact, volume conservation).
 
 ## Phase 5: FLIP/APIC GPU Compute
-1. [ ] GPU particle storage + integration (compute shader or CUDA kernels).
-2. [ ] GPU grid transfer kernels (P2G and G2P with atomics/tiling).
+1. [~] GPU particle storage + integration (Vulkan compute Mode 5, Euler step + CPU readback).
+2. [~] GPU grid transfer kernels (P2G with int atomics + CPU readback; G2P pending).
 3. [ ] GPU pressure solve (Jacobi/PCG/multigrid on device).
 4. [ ] GPU surface reconstruction (density/level set and smoothing).
 5. [ ] GPU visualization path (render directly from GPU buffers).
+6. [ ] GPU APIC affine transfer (affine storage + APIC P2G/G2P on device).
+7. [ ] GPU PBF constraints (position-based fluid solve on device).
+8. [ ] GPU level-set reinit + volume correction (match Mode 4 surface).
+9. [ ] GPU validation cases (drop/dam/volume metrics, parity with CPU).
+10. [ ] GPU debug readback toggles (matrix dumps, metrics snapshots).
+11. [ ] GPU/Vulkan interop path (zero-copy buffers for renderer).
 
 ## Phase 6: Advanced Features
 1. [ ] Add 3D support (staggered grid, memory management).
