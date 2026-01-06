@@ -5,7 +5,6 @@ Real-time 2D water simulation using Smoothed Particle Hydrodynamics (SPH).
 ## Quick Start
 
 ```bash
-./run.sh
 cargo run --release
 ```
 
