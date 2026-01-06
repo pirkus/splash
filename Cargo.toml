@@ -1,0 +1,10 @@
+[package]
+name = "sph-water-sim"
+version = "1.0.0"
+edition = "2021"
+authors = ["Your Name"]
+
+[dependencies]
+ndarray = "0.15"
+pixels = "0.13"
+winit = "0.28"
