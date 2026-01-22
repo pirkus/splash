@@ -1,70 +1,103 @@
 // Time integration for SPH
-// Leap-frog integration scheme
+// Velocity Verlet (default) and semi-implicit Euler options
 
-use super::particles::ParticleSystem;
+use super::particles::{Particle, ParticleSystem, Vec2};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Integrator {
+    Verlet,
+    Euler,
+}
 
 impl ParticleSystem {
-    /// Leap-frog integration step
-    /// This is symplectic and energy-conserving
-    pub fn integrate(&mut self, dt: f32) {
+    fn clamp_particle_to_domain(
+        particle: &mut Particle,
+        domain_width: f32,
+        domain_height: f32,
+        margin: f32,
+    ) {
+        if particle.position.x < margin {
+            particle.position.x = margin;
+            if particle.velocity.x < 0.0 {
+                particle.velocity.x = 0.0;
+            }
+        }
+        if particle.position.x > domain_width - margin {
+            particle.position.x = domain_width - margin;
+            if particle.velocity.x > 0.0 {
+                particle.velocity.x = 0.0;
+            }
+        }
+
+        if particle.position.y < margin {
+            particle.position.y = margin;
+            if particle.velocity.y < 0.0 {
+                particle.velocity.y = 0.0;
+            }
+        }
+        if particle.position.y > domain_height - margin {
+            particle.position.y = domain_height - margin;
+            if particle.velocity.y > 0.0 {
+                particle.velocity.y = 0.0;
+            }
+        }
+    }
+
+    fn limit_vector(vec: Vec2, max: f32) -> Vec2 {
+        let len = vec.length();
+        if len > max {
+            vec * (max / len)
+        } else {
+            vec
+        }
+    }
+
+    fn integrate_euler(&mut self, dt: f32) {
+        let max_velocity = 10.0;
+        let max_acc = 500.0;
         let domain_width = self.domain_width;
         let domain_height = self.domain_height;
-        let max_velocity = 10.0;  // Maximum velocity cap (10 m/s)
-        
+        let margin = self.smoothing_length;
+
         for particle in &mut self.particles {
-            // Compute acceleration from force
             let acc = particle.force * (1.0 / particle.mass);
-            
-            // Limit acceleration to prevent instability
-            let acc_mag = acc.length();
-            let max_acc = 500.0;  // 500 m/s² max
-            let acc_limited = if acc_mag > max_acc {
-                acc * (max_acc / acc_mag)
-            } else {
-                acc
-            };
-            
-            // Update velocity
-            particle.velocity += acc_limited * dt;
-            
-            // Limit velocity magnitude
-            let vel_mag = particle.velocity.length();
-            if vel_mag > max_velocity {
-                particle.velocity = particle.velocity * (max_velocity / vel_mag);
-            }
-            
-            // Update position
+            let acc = Self::limit_vector(acc, max_acc);
+
+            particle.velocity += acc * dt;
+            particle.velocity = Self::limit_vector(particle.velocity, max_velocity);
             particle.position += particle.velocity * dt;
-            
-            // Enforce domain boundaries (inline)
-            let margin = 0.001;  // 1mm margin
-            
-            // Clamp position
-            if particle.position.x < margin {
-                particle.position.x = margin;
-                if particle.velocity.x < 0.0 {
-                    particle.velocity.x = -particle.velocity.x * 0.3;  // Bounce with damping
-                }
-            }
-            if particle.position.x > domain_width - margin {
-                particle.position.x = domain_width - margin;
-                if particle.velocity.x > 0.0 {
-                    particle.velocity.x = -particle.velocity.x * 0.3;
-                }
-            }
-            
-            if particle.position.y < margin {
-                particle.position.y = margin;
-                if particle.velocity.y < 0.0 {
-                    particle.velocity.y = -particle.velocity.y * 0.3;
-                }
-            }
-            if particle.position.y > domain_height - margin {
-                particle.position.y = domain_height - margin;
-                if particle.velocity.y > 0.0 {
-                    particle.velocity.y = -particle.velocity.y * 0.3;
-                }
-            }
+
+            Self::clamp_particle_to_domain(particle, domain_width, domain_height, margin);
+        }
+    }
+
+    pub fn integrate_verlet(&mut self, dt: f32) {
+        let max_velocity = 10.0;
+        let max_acc = 500.0;
+        let half_dt = 0.5 * dt;
+        let domain_width = self.domain_width;
+        let domain_height = self.domain_height;
+        let margin = self.smoothing_length;
+
+        for particle in &mut self.particles {
+            let acc = particle.force * (1.0 / particle.mass);
+            let acc = Self::limit_vector(acc, max_acc);
+
+            particle.velocity += acc * half_dt;
+            particle.velocity = Self::limit_vector(particle.velocity, max_velocity);
+            particle.position += particle.velocity * dt;
+
+            Self::clamp_particle_to_domain(particle, domain_width, domain_height, margin);
+        }
+
+        self.compute_forces();
+
+        for particle in &mut self.particles {
+            let acc = particle.force * (1.0 / particle.mass);
+            let acc = Self::limit_vector(acc, max_acc);
+
+            particle.velocity += acc * half_dt;
+            particle.velocity = Self::limit_vector(particle.velocity, max_velocity);
         }
     }
 
@@ -78,7 +111,8 @@ impl ParticleSystem {
     /// Compute adaptive time step based on CFL condition
     pub fn compute_timestep(&self, cfl: f32) -> f32 {
         let max_vel = self.max_velocity();
-        let c_sound = (self.stiffness / self.rest_density).sqrt();  // Speed of sound
+        let gamma = 7.0;
+        let c_sound = (gamma * self.stiffness / self.rest_density).sqrt();  // Speed of sound
         let max_speed = max_vel.max(c_sound);
         
         // Conservative time step for stability
@@ -103,13 +137,26 @@ impl ParticleSystem {
         dt_cfl.min(dt_force).clamp(0.00001, 0.0005)
     }
 
+    /// Single SPH simulation step with adaptive CFL timestep
+    pub fn step_with_cfl(&mut self, cfl: f32, integrator: Integrator) -> f32 {
+        self.compute_forces();
+        let dt = self.compute_timestep(cfl);
+        self.step_with_integrator(dt, integrator);
+        dt
+    }
+
     /// Single SPH simulation step
     pub fn step(&mut self, dt: f32) {
-        // 1. Compute all forces
         self.compute_forces();
-        
-        // 2. Integrate equations of motion
-        self.integrate(dt);
+        self.step_with_integrator(dt, Integrator::Verlet);
+    }
+
+    /// Single SPH simulation step with chosen integrator
+    pub fn step_with_integrator(&mut self, dt: f32, integrator: Integrator) {
+        match integrator {
+            Integrator::Verlet => self.integrate_verlet(dt),
+            Integrator::Euler => self.integrate_euler(dt),
+        }
     }
 
     /// Get total kinetic energy (for diagnostics)
@@ -142,5 +189,34 @@ impl ParticleSystem {
         }
         let sum: f32 = self.particles.iter().map(|p| p.pressure).sum();
         sum / self.particles.len() as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::particles::{Particle, Vec2};
+
+    #[test]
+    fn test_timestep_decreases_with_stiffness_and_velocity() {
+        let mut system = ParticleSystem::new(0.2, 0.3);
+        system.smoothing_length = 0.001;
+        system.rest_density = 1000.0;
+        system.stiffness = 1000.0;
+
+        let mut particle = Particle::new(Vec2::new(0.1, 0.1), 1.0);
+        particle.velocity = Vec2::new(0.0, 0.0);
+        system.particles.push(particle);
+
+        let dt_base = system.compute_timestep(0.3);
+
+        system.stiffness = 4000.0;
+        let dt_stiffer = system.compute_timestep(0.3);
+        assert!(dt_stiffer < dt_base);
+
+        system.stiffness = 1000.0;
+        system.particles[0].velocity = Vec2::new(10.0, 0.0);
+        let dt_faster = system.compute_timestep(0.3);
+        assert!(dt_faster < dt_base);
     }
 }

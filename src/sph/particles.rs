@@ -148,6 +148,25 @@ impl ParticleSystem {
         }
     }
 
+    fn ensure_spatial_grid(&mut self) {
+        let desired_cell_size = 2.0 * self.smoothing_length;
+        let desired_nx = (self.domain_width / desired_cell_size).ceil() as usize;
+        let desired_ny = (self.domain_height / desired_cell_size).ceil() as usize;
+        let desired_cells = desired_nx * desired_ny;
+
+        if (self.cell_size - desired_cell_size).abs() > f32::EPSILON
+            || self.nx_cells != desired_nx
+            || self.ny_cells != desired_ny
+            || self.cells.len() != desired_cells
+        {
+            self.cell_size = desired_cell_size;
+            self.nx_cells = desired_nx;
+            self.ny_cells = desired_ny;
+            self.cells.clear();
+            self.cells.resize(desired_cells, Vec::new());
+        }
+    }
+
     /// Get cell index for a position
     fn get_cell_index(&self, pos: &Vec2) -> Option<usize> {
         let i = (pos.x / self.cell_size) as i32;
@@ -162,6 +181,8 @@ impl ParticleSystem {
 
     /// Build spatial hash grid for neighbor search
     pub fn build_spatial_hash(&mut self) {
+        self.ensure_spatial_grid();
+
         // Clear cells
         for cell in &mut self.cells {
             cell.clear();
@@ -175,23 +196,23 @@ impl ParticleSystem {
         }
     }
 
-    /// Get neighbors within smoothing radius
-    pub fn get_neighbors(&self, particle_idx: usize, radius: f32) -> Vec<usize> {
-        let mut neighbors = Vec::new();
+    /// Fill neighbors within a radius into the provided buffer
+    pub fn get_neighbors_into(&self, particle_idx: usize, radius: f32, neighbors: &mut Vec<usize>) {
+        neighbors.clear();
         let pos = self.particles[particle_idx].position;
-        
+
         // Check surrounding cells
         let i = (pos.x / self.cell_size) as i32;
         let j = (pos.y / self.cell_size) as i32;
-        
+
         for dy in -1..=1 {
             for dx in -1..=1 {
                 let ni = i + dx;
                 let nj = j + dy;
-                
+
                 if ni >= 0 && ni < self.nx_cells as i32 && nj >= 0 && nj < self.ny_cells as i32 {
                     let cell_idx = (nj as usize) * self.nx_cells + (ni as usize);
-                    
+
                     for &neighbor_idx in &self.cells[cell_idx] {
                         if neighbor_idx != particle_idx {
                             let diff = self.particles[neighbor_idx].position - pos;
@@ -203,7 +224,12 @@ impl ParticleSystem {
                 }
             }
         }
-        
+    }
+
+    /// Get neighbors within smoothing radius
+    pub fn get_neighbors(&self, particle_idx: usize, radius: f32) -> Vec<usize> {
+        let mut neighbors = Vec::new();
+        self.get_neighbors_into(particle_idx, radius, &mut neighbors);
         neighbors
     }
 
@@ -255,9 +281,10 @@ impl ParticleSystem {
         // First, compute SPH densities properly
         self.build_spatial_hash();
         let h = self.smoothing_length;
+        let mut neighbors = Vec::new();
         
         for i in 0..self.particles.len() {
-            let neighbors = self.get_neighbors(i, 2.0 * h);
+            self.get_neighbors_into(i, 2.0 * h, &mut neighbors);
             let pos_i = self.particles[i].position;
             
             // Compute SPH density
@@ -291,7 +318,11 @@ impl ParticleSystem {
     /// Let particles settle to hydrostatic equilibrium
     /// Run a few simulation steps with high damping
     pub fn settle(&mut self, duration: f32, damping: f32) {
-        let steps = (duration / 0.0001).round() as usize;
+        if duration <= 0.0 {
+            return;
+        }
+        let steps = (duration / 0.0001).ceil() as usize;
+        let steps = steps.max(1);
         let dt = duration / steps as f32;
         
         println!("    Settling: {} steps with damping={:.2}", steps, damping);
@@ -308,10 +339,11 @@ impl ParticleSystem {
             
             let h = self.smoothing_length;
             let mut forces = vec![Vec2::zero(); self.particles.len()];
+            let mut neighbors = Vec::new();
             
             // Compute densities
             for i in 0..self.particles.len() {
-                let neighbors = self.get_neighbors(i, 2.0 * h);
+                self.get_neighbors_into(i, 2.0 * h, &mut neighbors);
                 let pos_i = self.particles[i].position;
                 
                 let mut density = self.particles[i].mass * crate::sph::cubic_spline_kernel(0.0, h);
@@ -343,18 +375,17 @@ impl ParticleSystem {
                 force.y = -self.particles[i].mass * self.gravity;
                 
                 // Pressure force - use local copies to avoid borrow issues
-                let neighbors = self.get_neighbors(i, 2.0 * h);
+                self.get_neighbors_into(i, h, &mut neighbors);
                 let pos_i = self.particles[i].position;
                 let p_i = self.particles[i].pressure;
                 let rho_i = self.particles[i].density;
                 let m_i = self.particles[i].mass;
-                
-                let particles_copy: Vec<_> = neighbors.iter().map(|&j| {
-                    (self.particles[j].position, self.particles[j].pressure, 
-                     self.particles[j].density, self.particles[j].mass)
-                }).collect();
-                
-                for (pos_j, p_j, rho_j, m_j) in particles_copy {
+
+                for &j in &neighbors {
+                    let pos_j = self.particles[j].position;
+                    let p_j = self.particles[j].pressure;
+                    let rho_j = self.particles[j].density;
+                    let m_j = self.particles[j].mass;
                     let r_vec = (pos_i.x - pos_j.x, pos_i.y - pos_j.y);
                     let r = (r_vec.0 * r_vec.0 + r_vec.1 * r_vec.1).sqrt();
                     if r < 0.0001 { continue; }
@@ -393,5 +424,32 @@ impl ParticleSystem {
         for particle in &mut self.particles {
             particle.velocity = Vec2::zero();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spatial_grid_resizes_with_smoothing_length() {
+        let mut system = ParticleSystem::new(0.2, 0.3);
+        let old_cell_size = system.cell_size;
+        let old_cells_len = system.cells.len();
+
+        system.smoothing_length = 0.02;
+        system.build_spatial_hash();
+
+        let expected_cell_size = 2.0 * system.smoothing_length;
+        let expected_nx = (system.domain_width / expected_cell_size).ceil() as usize;
+        let expected_ny = (system.domain_height / expected_cell_size).ceil() as usize;
+        let expected_cells = expected_nx * expected_ny;
+
+        assert!(system.cell_size > old_cell_size);
+        assert_ne!(system.cells.len(), old_cells_len);
+        assert!((system.cell_size - expected_cell_size).abs() < 1e-6);
+        assert_eq!(system.nx_cells, expected_nx);
+        assert_eq!(system.ny_cells, expected_ny);
+        assert_eq!(system.cells.len(), expected_cells);
     }
 }

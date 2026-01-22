@@ -1,7 +1,7 @@
 // FAST SPH Real-time Renderer - Optimized for speed!
-// Run with: cargo run --release --bin sph-fast
+// Run with: cargo run --release
 
-use sph_water_sim::sph::ParticleSystem;
+use sph_water_sim::sph::{Integrator, ParticleSystem};
 use pixels::{Pixels, SurfaceTexture};
 use winit::dpi::PhysicalSize;
 use winit::event::{Event, WindowEvent, VirtualKeyCode};
@@ -14,6 +14,8 @@ const WINDOW_HEIGHT: u32 = 1200;
 
 fn main() {
     println!("=== FAST SPH Water Simulation ===\n");
+
+    let integrator = parse_integrator();
     
     // Domain setup
     let domain_width = 0.2;  // 20cm
@@ -35,6 +37,7 @@ fn main() {
     println!("🚀 SPEED OPTIMIZED:");
     println!("  Particle spacing: {:.1}mm (fewer particles)", particle_spacing * 1000.0);
     println!("  Smoothing length: {:.1}mm (larger search radius)", system.smoothing_length * 1000.0);
+    println!("  Integrator: {}", integrator_label(integrator));
     
     // Add water at bottom (1/3 of domain)
     let water_height = domain_height / 3.0;
@@ -125,8 +128,7 @@ fn main() {
             Event::MainEventsCleared => {
                 if !paused {
                     // Run simulation - SINGLE step per frame for speed!
-                    let dt = system.compute_timestep(0.3);  // CFL = 0.3
-                    system.step(dt);
+                    let dt = system.step_with_cfl(0.3, integrator);  // CFL = 0.3
                     time += dt;
                 }
                 
@@ -195,5 +197,46 @@ fn render(system: &ParticleSystem, frame: &mut [u8], domain_width: f32, domain_h
                 }
             }
         }
+    }
+}
+
+fn parse_integrator() -> Integrator {
+    let mut integrator = Integrator::Verlet;
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--integrator" => {
+                if let Some(value) = args.next() {
+                    if let Some(parsed) = parse_integrator_value(&value) {
+                        integrator = parsed;
+                    }
+                }
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--integrator=") {
+                    if let Some(parsed) = parse_integrator_value(value) {
+                        integrator = parsed;
+                    }
+                }
+            }
+        }
+    }
+
+    integrator
+}
+
+fn parse_integrator_value(value: &str) -> Option<Integrator> {
+    match value {
+        "verlet" => Some(Integrator::Verlet),
+        "euler" => Some(Integrator::Euler),
+        _ => None,
+    }
+}
+
+fn integrator_label(integrator: Integrator) -> &'static str {
+    match integrator {
+        Integrator::Verlet => "verlet",
+        Integrator::Euler => "euler",
     }
 }

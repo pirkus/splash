@@ -6,3 +6,4 @@ pub mod integration;
 
 pub use particles::{Particle, ParticleSystem, Vec2};
 pub use kernels::*;
+pub use integration::Integrator;

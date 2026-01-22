@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SPH Water Simulation - Detailed Overview</title>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)'], ['$', '$']],
+        displayMath: [['\\[', '\\]']]
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --ink: #1b1a16;
+      --ink-soft: #3a3328;
+      --water: #1f6fd2;
+      --water-deep: #134a8c;
+      --sand: #f1e6cf;
+      --foam: #f9f6ef;
+      --accent: #d36b3a;
+      --accent-soft: #f2b26c;
+      --bg-a: #f7efe2;
+      --bg-b: #e3f0f7;
+      --stroke: rgba(27, 26, 22, 0.12);
+      --shadow: 0 18px 40px rgba(18, 20, 24, 0.12);
+      --radius: 18px;
+      --font-display: "Cormorant Garamond", "Palatino Linotype", "Book Antiqua", serif;
+      --font-body: "Source Sans 3", "Trebuchet MS", "Verdana", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--font-body);
+      color: var(--ink);
+      background: radial-gradient(circle at 20% 10%, rgba(31, 111, 210, 0.18), transparent 45%),
+                  radial-gradient(circle at 85% 15%, rgba(211, 107, 58, 0.2), transparent 45%),
+                  linear-gradient(120deg, var(--bg-a), var(--bg-b));
+      min-height: 100vh;
+    }
+
+    main {
+      width: min(1100px, 92vw);
+      margin: 0 auto;
+      padding: 48px 0 72px;
+      display: grid;
+      gap: 28px;
+    }
+
+    .hero {
+      display: grid;
+      gap: 24px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      align-items: center;
+      padding: 28px;
+      border-radius: calc(var(--radius) + 6px);
+      background: rgba(249, 246, 239, 0.82);
+      box-shadow: var(--shadow);
+      border: 1px solid rgba(255, 255, 255, 0.6);
+      animation: rise 0.9s ease-out;
+    }
+
+    .kicker {
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 0.76rem;
+      color: var(--accent);
+      font-weight: 700;
+      margin: 0 0 10px;
+    }
+
+    h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2.2rem, 3.2vw, 3.6rem);
+      margin: 0 0 12px;
+      color: var(--ink);
+    }
+
+    h2 {
+      font-family: var(--font-display);
+      margin: 0 0 12px;
+      font-size: clamp(1.4rem, 2.2vw, 2rem);
+    }
+
+    h3 {
+      font-family: var(--font-display);
+      margin: 0 0 10px;
+      font-size: 1.2rem;
+    }
+
+    p {
+      line-height: 1.6;
+      margin: 0 0 12px;
+      color: var(--ink-soft);
+    }
+
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .chip {
+      background: rgba(31, 111, 210, 0.12);
+      border: 1px solid rgba(31, 111, 210, 0.22);
+      color: var(--water-deep);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 600;
+    }
+
+    .hero-art {
+      display: grid;
+      gap: 12px;
+      justify-items: center;
+    }
+
+    .caption {
+      font-size: 0.82rem;
+      color: rgba(27, 26, 22, 0.6);
+      text-align: center;
+      margin: 0;
+    }
+
+    .panel {
+      padding: 22px;
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid var(--stroke);
+      box-shadow: 0 12px 28px rgba(22, 26, 30, 0.08);
+      animation: fade 0.8s ease-out;
+    }
+
+    .grid-2 {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }
+
+    .grid-3 {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+
+    .steps {
+      list-style: none;
+      padding: 0;
+      margin: 14px 0 0;
+      display: grid;
+      gap: 10px;
+    }
+
+    .steps li {
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .step-index {
+      width: 26px;
+      height: 26px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 8px;
+      background: rgba(211, 107, 58, 0.16);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 0.85rem;
+    }
+
+    code, pre {
+      font-family: "IBM Plex Mono", "SFMono-Regular", "Consolas", "Courier New", monospace;
+      font-size: 0.92rem;
+    }
+
+    pre {
+      background: rgba(20, 23, 28, 0.92);
+      color: #f8f5ef;
+      padding: 16px;
+      border-radius: 12px;
+      overflow-x: auto;
+      margin: 0;
+    }
+
+    .math-block {
+      background: rgba(31, 111, 210, 0.08);
+      border: 1px solid rgba(31, 111, 210, 0.18);
+      padding: 14px 16px;
+      border-radius: 12px;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid rgba(27, 26, 22, 0.12);
+    }
+
+    th {
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      color: var(--water-deep);
+    }
+
+    .svg-card {
+      width: 100%;
+      border-radius: 16px;
+      border: 1px solid rgba(27, 26, 22, 0.15);
+      background: rgba(255, 255, 255, 0.85);
+      padding: 16px;
+    }
+
+    .footer {
+      text-align: center;
+      color: rgba(27, 26, 22, 0.55);
+      font-size: 0.85rem;
+      margin-top: 8px;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(18px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @keyframes fade {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="hero">
+      <div>
+        <p class="kicker">Repository Simulation Guide</p>
+        <h1>Smoothed Particle Hydrodynamics, rendered in real time</h1>
+        <p>
+          This project simulates 2D water with a particle system that approximates
+          the incompressible Navier-Stokes equations. Each particle carries mass,
+          density, pressure, velocity, and force. Neighbor interactions are limited
+          by a smoothing radius to stay performant.
+        </p>
+        <div class="chip-row">
+          <div class="chip">2D domain</div>
+          <div class="chip">Spatial hashing</div>
+          <div class="chip">Pressure + viscosity</div>
+          <div class="chip">Velocity Verlet</div>
+        </div>
+      </div>
+      <div class="hero-art">
+        <svg class="svg-card" viewBox="0 0 360 220" role="img" aria-label="Particle field illustration">
+          <rect x="0" y="0" width="360" height="220" rx="14" fill="#f6f1e6" />
+          <rect x="20" y="20" width="320" height="180" rx="10" fill="#ffffff" stroke="#d9d2c2" />
+          <g fill="#1f6fd2" opacity="0.86">
+            <circle cx="80" cy="150" r="8" />
+            <circle cx="110" cy="140" r="6" />
+            <circle cx="140" cy="150" r="7" />
+            <circle cx="170" cy="140" r="6" />
+            <circle cx="200" cy="148" r="8" />
+            <circle cx="230" cy="142" r="6" />
+            <circle cx="260" cy="150" r="7" />
+            <circle cx="120" cy="110" r="5" />
+            <circle cx="150" cy="100" r="6" />
+            <circle cx="190" cy="105" r="5" />
+            <circle cx="210" cy="92" r="4" />
+          </g>
+          <path d="M30 170 C90 165 130 130 190 120 C250 110 300 100 330 70" fill="none" stroke="#d36b3a" stroke-width="2" />
+          <text x="28" y="38" fill="#7c7468" font-size="12">Domain (0.2m x 0.3m)</text>
+        </svg>
+        <p class="caption">Particles sampled on a 2D domain, with a denser pool at the bottom.</p>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>Simulation loop</h2>
+      <p>
+        Each frame rebuilds the spatial hash, computes density and pressure, applies
+        pressure, viscosity, gravity, and boundary forces, then advances the system
+        with velocity Verlet (default) or Euler (optional).
+      </p>
+      <ul class="steps">
+        <li><span class="step-index">1</span><span>Build spatial hash grid (cell size = 2h).</span></li>
+        <li><span class="step-index">2</span><span>Compute density and pressure for each particle.</span></li>
+        <li><span class="step-index">3</span><span>Accumulate pressure, viscosity, gravity, and boundary forces.</span></li>
+        <li><span class="step-index">4</span><span>Pick adaptive dt with CFL and integrate.</span></li>
+      </ul>
+      <div style="margin-top: 14px;">
+        <pre><code>for each frame:
+  build_spatial_hash()
+  compute_densities()
+  compute_pressures()
+  compute_forces()
+  integrate(dt)
+</code></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Core math model</h2>
+      <p>
+        The simulation follows weakly compressible SPH. Density is sampled from
+        neighbors with a smoothing kernel, pressure is derived from an equation
+        of state, and forces are accumulated symmetrically to conserve momentum.
+      </p>
+      <div class="grid-2">
+        <div>
+          <h3>SPH discretization</h3>
+          <div class="math-block">
+            \[
+              \rho_i = \sum_j m_j W(r_{ij}, h)
+            \]
+            \[
+              p_i = k \left(\left(\frac{\rho_i}{\rho_0}\right)^{\gamma} - 1\right)
+            \]
+            \[
+              a_i^{\text{pressure}} =
+              -\sum_j m_j \left(\frac{p_i}{\rho_i^2} + \frac{p_j}{\rho_j^2}\right) \nabla W(r_{ij}, h)
+            \]
+            \[
+              a_i^{\text{visc}} =
+              \mu \sum_j \frac{m_j}{\rho_j} (v_j - v_i) \nabla^2 W(r_{ij}, h)
+            \]
+          </div>
+        </div>
+        <div>
+          <h3>Stability controls</h3>
+          <div class="math-block">
+            \[
+              c_s = \sqrt{\gamma k / \rho_0}
+            \]
+            \[
+              \Delta t_{\mathrm{cfl}} = \frac{cfl \, h}{v_{\max} + c_s}
+            \]
+            \[
+              \Delta t_{\mathrm{force}} = \sqrt{\frac{h}{a_{\max}}}
+            \]
+            \[
+              \Delta t = \min(\Delta t_{\mathrm{cfl}}, \Delta t_{\mathrm{force}})
+            \]
+          </div>
+          <p>
+            These constraints keep particles from moving too far in one step and
+            limit acceleration spikes. Larger k increases c_s and reduces dt.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Method details</h2>
+      <div class="grid-3">
+        <div>
+          <h3>Spatial hashing</h3>
+          <p>
+            Particles are hashed into a uniform grid so each particle only checks
+            its 3x3 neighboring cells, keeping neighbor search near O(N).
+          </p>
+          <div class="math-block">
+            \[
+              s = 2h,\quad cell = \left(\left\lfloor \frac{x}{s} \right\rfloor,\;
+              \left\lfloor \frac{y}{s} \right\rfloor\right)
+            \]
+            \[
+              \text{accept } j \text{ if } \lVert r_{ij} \rVert \lt r_{\text{search}}
+            \]
+          </div>
+        </div>
+        <div>
+          <h3>Boundary penalty</h3>
+          <p>
+            Penalty forces push particles back inside the domain with a damping
+            factor to remove energy near walls. Positions are clamped for safety.
+          </p>
+          <div class="math-block">
+            \[
+              x \lt m:\quad F_x \mathrel{+}= k_b (m - x),\quad v_x \leftarrow v_x d
+            \]
+            \[
+              x \gt W - m:\quad F_x \mathrel{-}= k_b (x - (W - m)),\quad v_x \leftarrow v_x d
+            \]
+          </div>
+        </div>
+        <div>
+          <h3>Velocity Verlet</h3>
+          <p>
+            Verlet uses two force evaluations per step. It is more stable than
+            Euler at the same dt without a big accuracy cost.
+          </p>
+          <div class="math-block">
+            \[
+              v^{n+1/2} = v^n + \tfrac{1}{2} a^n \Delta t
+            \]
+            \[
+              x^{n+1} = x^n + v^{n+1/2} \Delta t
+            \]
+            \[
+              v^{n+1} = v^{n+1/2} + \tfrac{1}{2} a^{n+1} \Delta t
+            \]
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2>Kernels and density estimation</h2>
+        <p>
+          A cubic spline kernel spreads particle mass over a radius of 2h, producing
+          smooth density estimates. Pressure uses a spiky kernel gradient with
+          support limited to h for stable repulsion.
+        </p>
+        <p>
+          Density is approximated as: \( \rho_i = \sum_j m_j W(r_{ij}, h) \)
+        </p>
+        <p class="badge">Kernel files: src/sph/kernels.rs</p>
+      </div>
+      <div class="panel hero-art">
+        <svg class="svg-card" viewBox="0 0 360 220" role="img" aria-label="Kernel profile chart">
+          <rect x="0" y="0" width="360" height="220" rx="14" fill="#ffffff" />
+          <g stroke="#c9c1b3" stroke-width="1">
+            <line x1="40" y1="170" x2="320" y2="170" />
+            <line x1="40" y1="40" x2="40" y2="170" />
+          </g>
+          <polyline
+            points="40,170 80,130 120,95 160,80 200,85 240,110 280,150 320,170"
+            fill="none" stroke="#1f6fd2" stroke-width="3" />
+          <circle cx="40" cy="170" r="4" fill="#d36b3a" />
+          <circle cx="320" cy="170" r="4" fill="#d36b3a" />
+          <text x="50" y="190" fill="#7c7468" font-size="12">r = 0</text>
+          <text x="270" y="190" fill="#7c7468" font-size="12">r = 2h</text>
+          <text x="50" y="30" fill="#7c7468" font-size="12">W(r, h)</text>
+        </svg>
+        <p class="caption">Cubic spline kernel shape (2D normalization).</p>
+      </div>
+    </section>
+
+    <section class="grid-3">
+      <div class="panel">
+        <h3>Pressure</h3>
+        <p>
+          Pressure is derived from density using a Tait-style equation of state.
+          The symmetric formulation enforces equal and opposite forces.
+        </p>
+        <p class="badge">Pressure force: src/sph/forces.rs</p>
+      </div>
+      <div class="panel">
+        <h3>Viscosity</h3>
+        <p>
+          Viscosity smooths velocity differences across neighbors with a Laplacian
+          kernel, dissipating energy and calming noise.
+        </p>
+        <p class="badge">Viscosity force: src/sph/forces.rs</p>
+      </div>
+      <div class="panel">
+        <h3>Boundaries</h3>
+        <p>
+          Penalty forces push particles back inside the domain, with light damping
+          near walls. Positions are clamped for safety.
+        </p>
+        <p class="badge">Boundary force: src/sph/forces.rs</p>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2>Integration choices</h2>
+        <p>
+          Velocity Verlet is the default integrator. It uses two force evaluations
+          per step, improving stability without the full cost of higher-order
+          schemes. Semi-implicit Euler is available for faster, rougher motion.
+        </p>
+        <pre><code>cargo run --release -- --integrator=verlet
+cargo run --release -- --integrator=euler</code></pre>
+      </div>
+      <div class="panel hero-art">
+        <svg class="svg-card" viewBox="0 0 360 220" role="img" aria-label="Integrator comparison">
+          <rect x="0" y="0" width="360" height="220" rx="14" fill="#ffffff" />
+          <path d="M40 170 C90 120 140 80 200 90 C260 100 300 140 320 150" fill="none" stroke="#1f6fd2" stroke-width="3" />
+          <path d="M40 170 C90 145 140 110 200 120 C260 130 300 155 320 170" fill="none" stroke="#d36b3a" stroke-width="3" stroke-dasharray="6 6" />
+          <text x="50" y="40" fill="#7c7468" font-size="12">Verlet (smoother)</text>
+          <text x="50" y="60" fill="#7c7468" font-size="12">Euler (faster)</text>
+        </svg>
+        <p class="caption">Verlet keeps trajectories smoother at the same dt.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Code map</h2>
+      <div class="grid-2">
+        <div>
+          <h3>Modules</h3>
+          <p><strong>src/main.rs</strong> - window, input, render loop</p>
+          <p><strong>src/lib.rs</strong> - library exports</p>
+          <p><strong>src/sph/particles.rs</strong> - Vec2, Particle, spatial hash</p>
+          <p><strong>src/sph/kernels.rs</strong> - kernel functions</p>
+          <p><strong>src/sph/forces.rs</strong> - pressure, viscosity, gravity</p>
+          <p><strong>src/sph/integration.rs</strong> - CFL timestep, integrators</p>
+        </div>
+        <div>
+          <h3>Core data</h3>
+          <p><strong>Vec2</strong> holds position, velocity, and force.</p>
+          <p><strong>Particle</strong> tracks mass, density, pressure.</p>
+          <p><strong>ParticleSystem</strong> owns particles, grid, and parameters.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Parameter cheat sheet</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>What it does</th>
+            <th>Effect of increase</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>smoothing_length (h)</td>
+            <td>Neighbor radius, kernel width</td>
+            <td>Fewer particles, more smoothing</td>
+          </tr>
+          <tr>
+            <td>stiffness (k)</td>
+            <td>Pressure response</td>
+            <td>Less compressibility, smaller dt</td>
+          </tr>
+          <tr>
+            <td>viscosity (mu)</td>
+            <td>Velocity diffusion</td>
+            <td>Thicker, calmer flow</td>
+          </tr>
+          <tr>
+            <td>cfl</td>
+            <td>Adaptive timestep scale</td>
+            <td>Higher dt, risk of instability</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2>Controls and runtime</h2>
+        <p><strong>ESC/Q</strong> quits. <strong>SPACE</strong> pauses.</p>
+        <p>Recommended: run the release build for smooth real-time motion.</p>
+        <pre><code>./run.sh
+cargo run --release</code></pre>
+      </div>
+      <div class="panel">
+        <h2>Diagnostics</h2>
+        <p>
+          The simulation logs FPS, time ratio, mass retention, and particle count
+          every second. This helps spot instability or particle loss.
+        </p>
+        <p class="badge">Stat output: src/main.rs</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Performance profile</h2>
+      <p>
+        Spatial hashing keeps neighbor search near O(N). The default settings
+        target real-time performance on typical hardware, with fewer particles
+        but larger smoothing length for a stable pool and visible droplets.
+      </p>
+    </section>
+
+    <p class="footer">Generated overview for the SPH water simulation repository.</p>
+  </main>
+</body>
+</html>

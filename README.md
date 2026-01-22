@@ -9,6 +9,12 @@ Real-time 2D water simulation using Smoothed Particle Hydrodynamics (SPH).
 cargo run --release
 ```
 
+Optional integrator selection:
+```bash
+cargo run --release -- --integrator=verlet
+cargo run --release -- --integrator=euler
+```
+
 **Controls:** ESC/Q = Quit, SPACE = Pause
 
 ---

@@ -8,9 +8,10 @@ impl ParticleSystem {
     /// Compute density for all particles using SPH interpolation
     pub fn compute_densities(&mut self) {
         let h = self.smoothing_length;
+        let mut neighbors = Vec::new();
         
         for i in 0..self.particles.len() {
-            let neighbors = self.get_neighbors(i, 2.0 * h);
+            self.get_neighbors_into(i, 2.0 * h, &mut neighbors);
             let pos_i = self.particles[i].position;
             
             // Self-contribution
@@ -60,9 +61,10 @@ impl ParticleSystem {
     pub fn compute_pressure_forces(&mut self) {
         let h = self.smoothing_length;
         let mut forces = vec![Vec2::zero(); self.particles.len()];
+        let mut neighbors = Vec::new();
         
         for (i, force) in forces.iter_mut().enumerate().take(self.particles.len()) {
-            let neighbors = self.get_neighbors(i, 2.0 * h);
+            self.get_neighbors_into(i, h, &mut neighbors);
             let pos_i = self.particles[i].position;
             let rho_i = self.particles[i].density;
             let p_i = self.particles[i].pressure;
@@ -110,9 +112,10 @@ impl ParticleSystem {
         let h = self.smoothing_length;
         let mu = self.viscosity;
         let mut forces = vec![Vec2::zero(); self.particles.len()];
+        let mut neighbors = Vec::new();
         
         for (i, force) in forces.iter_mut().enumerate().take(self.particles.len()) {
-            let neighbors = self.get_neighbors(i, 2.0 * h);
+            self.get_neighbors_into(i, h, &mut neighbors);
             let pos_i = self.particles[i].position;
             let vel_i = self.particles[i].velocity;
             let m_i = self.particles[i].mass;
@@ -149,8 +152,9 @@ impl ParticleSystem {
     }
 
     /// Apply boundary forces (penalty method)
-    pub fn apply_boundary_forces(&mut self, boundary_stiffness: f32) {
+    pub fn apply_boundary_forces(&mut self, boundary_stiffness: f32, boundary_damping: f32) {
         let margin = self.smoothing_length;
+        let damping = boundary_damping.clamp(0.0, 1.0);
         
         for particle in &mut self.particles {
             // Left boundary
@@ -160,7 +164,7 @@ impl ParticleSystem {
                 particle.force.x += force;
                 // Damping for wall collision
                 if particle.velocity.x < 0.0 {
-                    particle.velocity.x *= 0.3;
+                    particle.velocity.x *= damping;
                 }
             }
             
@@ -171,7 +175,7 @@ impl ParticleSystem {
                 particle.force.x -= force;
                 // Damping for wall collision
                 if particle.velocity.x > 0.0 {
-                    particle.velocity.x *= 0.3;
+                    particle.velocity.x *= damping;
                 }
             }
             
@@ -182,7 +186,7 @@ impl ParticleSystem {
                 particle.force.y += force;
                 // Damping for bottom collision
                 if particle.velocity.y < 0.0 {
-                    particle.velocity.y *= 0.3;
+                    particle.velocity.y *= damping;
                 }
             }
             
@@ -192,7 +196,7 @@ impl ParticleSystem {
                 let force = boundary_stiffness * penetration;
                 particle.force.y -= force;
                 if particle.velocity.y > 0.0 {
-                    particle.velocity.y *= 0.3;
+                    particle.velocity.y *= damping;
                 }
             }
         }
@@ -218,7 +222,9 @@ impl ParticleSystem {
         self.compute_gravity_forces();
         
         // Softer boundary forces for stability
-        self.apply_boundary_forces(5000.0);  // Reduced from 10000
+        let boundary_stiffness = self.stiffness * 0.8;
+        let boundary_damping = 0.5;
+        self.apply_boundary_forces(boundary_stiffness, boundary_damping);
         
         // Limit total force magnitude to prevent explosions
         let max_force = 1000.0;  // Maximum total force per particle
